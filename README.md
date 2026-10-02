@@ -34,8 +34,8 @@ has bound the port.
 
 ## HTTP API
 
-All request and response bodies are JSON except the `jsonl` and `tsv` run
-export endpoints, and unknown fields are rejected. Both `POST` endpoints
+All request and response bodies are JSON except the `jsonl`, `tsv` and `vcf`
+run export endpoints, and unknown fields are rejected. Both `POST` endpoints
 require an `Idempotency-Key` header; repeating a key returns the stored first
 response verbatim, and reusing a key for another operation is a `conflict`.
 
@@ -212,9 +212,25 @@ Formatting rules:
   as `KEY`; empty INFO is `.`;
 - numbers use the JSON decimal representation and text is not quoted.
 
-A run with no variants returns just the header line. An unknown `run_id`
-returns 404 `not_found`; any `format` other than `jsonl` or `tsv` returns 400
-`validation_error`, both with the standard error object.
+`vcf` is served as `text/x-variant-call-format; charset=utf-8`: the retained
+ALT alleles rendered back as VCF v4.2 text (UTF-8, LF). The header opens with
+`##fileformat=VCFv4.2`, replays the sample's other meta lines in upload order,
+then adds a fixed `##source=variantrail` line and four `##INFO` declarations
+(`ALLELE_INDEX` as Integer, `VT_GENE`, `VT_CONSEQUENCE` and `VT_IMPACT` as
+String, all `Number=1`), followed by the `#CHROM POS ID REF ALT QUAL FILTER
+INFO` column header. Each retained ALT allele is one row, in variant file
+order and `allele_index` order; `ALT` carries only the current allele. `ID`,
+`QUAL` and an empty `FILTER` are written as `.`; the original `INFO` keys come
+first, sorted lexicographically, followed by the four export keys (`VT_GENE`
+is `NA` when no gene is annotated). If any retained variant's original `INFO`
+already uses one of the reserved keys (`ALLELE_INDEX`, `VT_GENE`,
+`VT_CONSEQUENCE`, `VT_IMPACT`), the export fails with 400 `validation_error`
+naming the conflicting key.
+
+A run with no variants returns just the header (`tsv`: the header line; `vcf`:
+the header block). An unknown `run_id` returns 404 `not_found`; any `format`
+other than `jsonl`, `tsv` or `vcf` returns 400 `validation_error`, both with
+the standard error object.
 
 ### Compare two runs
 

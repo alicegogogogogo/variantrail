@@ -599,9 +599,129 @@ class VariantRailTests(unittest.TestCase):
         before = self.service._document("run-1")
         self.service.run_export("run-1", "tsv")
         self.service.run_export("run-1", "jsonl")
+        self.service.run_export("run-1", "vcf")
         after = self.service._document("run-1")
         self.assertEqual(before, after)
         self.assertTrue(self.service.run_provenance("run-1")["verified"])
+
+    # --- VCF export ----------------------------------------------------------
+
+    VCF_HEADER_LINES = [
+        "##fileformat=VCFv4.2",
+        "##reference=GRCh38",
+        "##contig=<ID=chr1>",
+        "##source=variantrail",
+        '##INFO=<ID=ALLELE_INDEX,Number=1,Type=Integer,Description="Index of the ALT allele in the original record">',
+        '##INFO=<ID=VT_GENE,Number=1,Type=String,Description="VariantRail gene annotation, NA when no gene is annotated">',
+        '##INFO=<ID=VT_CONSEQUENCE,Number=1,Type=String,Description="VariantRail consequence annotation">',
+        '##INFO=<ID=VT_IMPACT,Number=1,Type=String,Description="VariantRail impact annotation">',
+        HEADER,
+    ]
+
+    def test_vcf_export_has_fixed_header_and_one_row_per_allele(self):
+        self.sample()
+        self.start_run()
+        content_type, body = self.service.run_export("run-1", "vcf")
+        self.assertEqual("text/x-variant-call-format; charset=utf-8", content_type)
+        text = body.decode("utf-8")
+        self.assertNotIn("\r", text)
+        lines = text.split("\n")
+        self.assertEqual("", lines[-1])  # exactly one trailing LF
+        rows = lines[len(self.VCF_HEADER_LINES):-1]
+        self.assertEqual(self.VCF_HEADER_LINES, lines[: len(self.VCF_HEADER_LINES)])
+        self.assertEqual(8, len(rows))  # seven records, one with two ALTs
+        self.assertEqual(
+            "chr1\t11856378\trs1\tG\tA\t60.0\tPASS\t"
+            "DP=42;ALLELE_INDEX=1;VT_GENE=MTHFR;VT_CONSEQUENCE=missense_variant;VT_IMPACT=MODERATE",
+            rows[0],
+        )
+        self.assertEqual(
+            "chr1\t11856378\trs2\tG\tT\t20.0\tPASS\t"
+            "DP=42;ALLELE_INDEX=1;VT_GENE=MTHFR;VT_CONSEQUENCE=stop_gained;VT_IMPACT=HIGH",
+            rows[1],
+        )
+        # Missing ID and QUAL render as '.', gene falls back to NA.
+        self.assertEqual(
+            "chr1\t11856379\t.\tA\tG\t.\tq10\t"
+            "DP=5;ALLELE_INDEX=1;VT_GENE=NA;VT_CONSEQUENCE=intergenic_variant;VT_IMPACT=MODIFIER",
+            rows[2],
+        )
+        # Empty original INFO contributes no keys before the export keys.
+        self.assertEqual(
+            "chr7\t55019017\t.\tG\tT\t50.0\tPASS\t"
+            "ALLELE_INDEX=1;VT_GENE=EGFR;VT_CONSEQUENCE=stop_gained;VT_IMPACT=HIGH",
+            rows[4],
+        )
+        # Multi-ALT record: one row per allele, allele_index in file order.
+        self.assertEqual(
+            "chr12\t25245350\t.\tC\tA\t80.0\tPASS\t"
+            "DP=60;ALLELE_INDEX=1;VT_GENE=KRAS;VT_CONSEQUENCE=missense_variant;VT_IMPACT=MODERATE",
+            rows[5],
+        )
+        self.assertEqual(
+            "chr12\t25245350\t.\tC\tT\t80.0\tPASS\t"
+            "DP=60;ALLELE_INDEX=2;VT_GENE=KRAS;VT_CONSEQUENCE=missense_variant;VT_IMPACT=MODERATE",
+            rows[6],
+        )
+
+    def test_vcf_export_sorts_original_info_keys_before_export_keys(self):
+        vcf = single(pos=11856379, ref="A", alt="G", qual=".", filter_value=".", info="DP=7;ZZ=1;AA=2;FLAG")
+        self.sample(vcf=vcf)
+        self.start_run()
+        _, body = self.service.run_export("run-1", "vcf")
+        row = body.decode("utf-8").split("\n")[len(self.VCF_HEADER_LINES)]
+        self.assertEqual(
+            "chr1\t11856379\t.\tA\tG\t.\t.\t"
+            "AA=2;DP=7;FLAG;ZZ=1;ALLELE_INDEX=1;VT_GENE=NA;VT_CONSEQUENCE=intergenic_variant;VT_IMPACT=MODIFIER",
+            row,
+        )
+
+    def test_vcf_export_replays_sample_meta_lines_in_upload_order(self):
+        preamble = "##fileformat=VCFv4.3\n##contig=<ID=chr1>\n##reference=GRCh38\n##extra=kept"
+        vcf = "\n".join([preamble, HEADER, "chr1\t11856378\t.\tG\tA\t60\tPASS\tDP=42"]) + "\n"
+        self.sample(vcf=vcf)
+        self.start_run()
+        _, body = self.service.run_export("run-1", "vcf")
+        lines = body.decode("utf-8").split("\n")
+        self.assertEqual("##fileformat=VCFv4.2", lines[0])
+        self.assertEqual(
+            ["##contig=<ID=chr1>", "##reference=GRCh38", "##extra=kept", "##source=variantrail"],
+            lines[1:5],
+        )
+
+    def test_vcf_export_empty_run_has_header_only(self):
+        self.sample()
+        self.start_run({"genes": ["NO_SUCH_GENE"]})
+        content_type, body = self.service.run_export("run-1", "vcf")
+        self.assertEqual("text/x-variant-call-format; charset=utf-8", content_type)
+        self.assertEqual(("\n".join(self.VCF_HEADER_LINES) + "\n").encode("utf-8"), body)
+
+    def test_vcf_export_is_byte_stable_across_requests(self):
+        self.sample()
+        self.start_run()
+        first = self.service.run_export("run-1", "vcf")
+        second = self.service.run_export("run-1", "vcf")
+        self.assertEqual(first, second)
+
+    def test_vcf_export_rejects_reserved_info_keys(self):
+        for index, (info, key) in enumerate(
+            [("ALLELE_INDEX=3", "ALLELE_INDEX"), ("VT_GENE=X", "VT_GENE"), ("DP=4;VT_IMPACT=HIGH", "VT_IMPACT")]
+        ):
+            with self.subTest(info=info):
+                self.sample(vcf=single(info=info), key=f"sk{index}", sample_id=f"sample-{index}")
+                self.start_run(key=f"rk{index}", run_id=f"run-{index}", sample_id=f"sample-{index}")
+                with self.assertRaisesRegex(ValidationError, key):
+                    self.service.run_export(f"run-{index}", "vcf")
+                # Other formats are unaffected by the reserved keys.
+                self.service.run_export(f"run-{index}", "tsv")
+
+    def test_vcf_export_validates_format_and_run_existence(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(ValidationError, "jsonl, tsv, vcf"):
+            self.service.run_export("run-1", "csv")
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.run_export("missing", "vcf")
 
 
 class ExportHttpTests(unittest.TestCase):
@@ -643,6 +763,16 @@ class ExportHttpTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("text/tab-separated-values; charset=utf-8", content_type)
         self.assertEqual(TSV_HEADER, body.decode("utf-8").split("\n")[0])
+        status, content_type, body = self.get("/runs/run-1/exports/vcf")
+        self.assertEqual(200, status)
+        self.assertEqual("text/x-variant-call-format; charset=utf-8", content_type)
+        text = body.decode("utf-8")
+        self.assertEqual("##fileformat=VCFv4.2", text.split("\n")[0])
+        self.assertEqual(HEADER, text.split("\n")[8])
+        self.assertEqual(8, len(text.strip().split("\n")) - 9)
+        # Repeated requests are byte-for-byte identical.
+        _, _, again = self.get("/runs/run-1/exports/vcf")
+        self.assertEqual(body, again)
 
     def test_export_errors_use_the_standard_error_object(self):
         status, content_type, body = self.get("/runs/missing/exports/tsv")
