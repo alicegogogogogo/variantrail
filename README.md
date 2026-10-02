@@ -216,6 +216,53 @@ A run with no variants returns just the header line. An unknown `run_id`
 returns 404 `not_found`; any `format` other than `jsonl` or `tsv` returns 400
 `validation_error`, both with the standard error object.
 
+### Compare two runs
+
+`GET /runs/run-1/compare/run-2` reads only the final retained ALT alleles of two
+completed runs and reports how the runs overlap. It never recomputes a pipeline
+step and never modifies either run or its exports; the endpoint is a plain GET
+and needs no `Idempotency-Key`. The left side is `run-1` and the right side is
+`run-2`; the runs may come from different samples.
+
+Allele identity is the tuple `(chrom, pos, ref, alt)`; a repeated identity
+within one run counts only once. Each array entry carries the annotation fields
+`gene`, `consequence`, `impact` (`gene` is JSON `null` when the annotation
+table has no match):
+
+```json
+{"left":{"run_id":"run-1","sample_id":"trio-1","sample_sha256":"...","allele_count":3},
+ "right":{"run_id":"run-2","sample_id":"trio-2","sample_sha256":"...","allele_count":3},
+ "counts":{"shared":1,"left_only":2,"right_only":2,"union":5},
+ "shared":[{"chrom":"chr1","pos":11856378,"ref":"G","alt":"A",
+            "gene":"MTHFR","consequence":"missense_variant","impact":"MODERATE"}],
+ "left_only":[{"chrom":"chr17","pos":43093445,"ref":"C","alt":"T",
+               "gene":"BRCA1","consequence":"stop_gained","impact":"HIGH"}],
+ "right_only":[{"chrom":"chr12","pos":25245350,"ref":"C","alt":"A",
+                "gene":"KRAS","consequence":"missense_variant","impact":"MODERATE"}],
+ "gene_summary":{"BRCA1":{"shared":0,"left_only":1,"right_only":0},
+                 "MTHFR":{"shared":1,"left_only":0,"right_only":0},
+                 "NA":{"shared":0,"left_only":1,"right_only":0}},
+ "impact_summary":{"HIGH":{"shared":0,"left_only":1,"right_only":0},
+                   "MODERATE":{"shared":1,"left_only":1,"right_only":1},
+                   "MODIFIER":{"shared":0,"left_only":0,"right_only":1}}}
+```
+
+- `shared` holds identities present on both sides, `left_only` and
+  `right_only` identities present on one side only.
+- `counts.shared`, `counts.left_only` and `counts.right_only` are the array
+  lengths; `counts.union` is their sum.
+- Every array is sorted by `chrom` as text, then `pos` numerically, then
+  `ref`, then `alt`, so repeated requests are byte-for-byte identical.
+- `gene_summary` and `impact_summary` count alleles per `gene` (a null gene
+  uses the key `NA`) and per `impact` in each of the three buckets; the object
+  keys are sorted lexicographically and every bucket key is present.
+- Comparing a run with itself puts every allele in `shared`; the two sides may
+  be the same `run_id`.
+
+A missing `run_id` on either side returns 404 `not_found` with the standard
+error object, e.g. `{"error":{"code":"not_found","message":"run run-x was not found"}}`;
+the left run is looked up first.
+
 ### The annotation table
 
 Annotation matches the exact tuple `(CHROM, POS, REF, ALT)`. A variant with no

@@ -474,6 +474,241 @@ class VariantRailTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertTrue(self.service.run_provenance("run-1")["verified"])
 
+    # --- run comparison ----------------------------------------------------
+
+    COMPARE_LEFT = "\n".join(
+        [
+            PREAMBLE,
+            HEADER,
+            "chr1\t11856378\t.\tG\tA\t60\tPASS\tDP=10",
+            "chr7\t55019017\t.\tG\tGA\t60\tPASS\tDP=10",
+            "chr17\t43093445\t.\tC\tT\t60\tPASS\tDP=10",
+        ]
+    ) + "\n"
+    COMPARE_RIGHT = "\n".join(
+        [
+            PREAMBLE,
+            HEADER,
+            "chr1\t100\t.\tA\tG\t60\tPASS\tDP=10",
+            "chr1\t11856378\t.\tG\tA\t60\tPASS\tDP=10",
+            "chr12\t25245350\t.\tC\tA\t60\tPASS\tDP=10",
+        ]
+    ) + "\n"
+
+    def _comparable_runs(self):
+        self.sample(key="s1", vcf=self.COMPARE_LEFT, sample_id="s1")
+        self.sample(key="s2", vcf=self.COMPARE_RIGHT, sample_id="s2")
+        self.start_run(key="r1", run_id="run-1", sample_id="s1")
+        self.start_run(key="r2", run_id="run-2", sample_id="s2")
+
+    def test_compare_two_runs_reports_shared_and_unique_alleles(self):
+        self._comparable_runs()
+        payload = self.service.compare_runs("run-1", "run-2")
+
+        left_sha = self.service.get_sample("s1")["sha256"]
+        right_sha = self.service.get_sample("s2")["sha256"]
+        self.assertEqual(
+            {"run_id": "run-1", "sample_id": "s1", "sample_sha256": left_sha, "allele_count": 3},
+            payload["left"],
+        )
+        self.assertEqual(
+            {"run_id": "run-2", "sample_id": "s2", "sample_sha256": right_sha, "allele_count": 3},
+            payload["right"],
+        )
+        self.assertEqual({"shared": 1, "left_only": 2, "right_only": 2, "union": 5}, payload["counts"])
+
+        shared = {"chrom": "chr1", "pos": 11856378, "ref": "G", "alt": "A",
+                  "gene": "MTHFR", "consequence": "missense_variant", "impact": "MODERATE"}
+        # chr17 sorts before chr7 under text ordering.
+        self.assertEqual(
+            [
+                {"chrom": "chr17", "pos": 43093445, "ref": "C", "alt": "T",
+                 "gene": "BRCA1", "consequence": "stop_gained", "impact": "HIGH"},
+                {"chrom": "chr7", "pos": 55019017, "ref": "G", "alt": "GA",
+                 "gene": "EGFR", "consequence": "frameshift_variant", "impact": "HIGH"},
+            ],
+            payload["left_only"],
+        )
+        self.assertEqual(
+            [
+                {"chrom": "chr1", "pos": 100, "ref": "A", "alt": "G",
+                 "gene": None, "consequence": "intergenic_variant", "impact": "MODIFIER"},
+                {"chrom": "chr12", "pos": 25245350, "ref": "C", "alt": "A",
+                 "gene": "KRAS", "consequence": "missense_variant", "impact": "MODERATE"},
+            ],
+            payload["right_only"],
+        )
+        self.assertEqual([shared], payload["shared"])
+        for name in ("shared", "left_only", "right_only"):
+            self.assertEqual(payload["counts"][name], len(payload[name]))
+        self.assertEqual(
+            payload["counts"]["union"],
+            sum(payload["counts"][name] for name in ("shared", "left_only", "right_only")),
+        )
+
+        self.assertEqual(
+            {
+                "BRCA1": {"shared": 0, "left_only": 1, "right_only": 0},
+                "EGFR": {"shared": 0, "left_only": 1, "right_only": 0},
+                "KRAS": {"shared": 0, "left_only": 0, "right_only": 1},
+                "MTHFR": {"shared": 1, "left_only": 0, "right_only": 0},
+                "NA": {"shared": 0, "left_only": 0, "right_only": 1},
+            },
+            payload["gene_summary"],
+        )
+        self.assertEqual(
+            {
+                "HIGH": {"shared": 0, "left_only": 2, "right_only": 0},
+                "MODERATE": {"shared": 1, "left_only": 0, "right_only": 1},
+                "MODIFIER": {"shared": 0, "left_only": 0, "right_only": 1},
+            },
+            payload["impact_summary"],
+        )
+        self.assertEqual(list(payload["gene_summary"]), sorted(payload["gene_summary"]))
+        self.assertEqual(list(payload["impact_summary"]), sorted(payload["impact_summary"]))
+        # Repeated requests are byte-for-byte stable.
+        self.assertEqual(payload, self.service.compare_runs("run-1", "run-2"))
+
+    def test_compare_same_run_puts_every_allele_in_shared(self):
+        self._comparable_runs()
+        payload = self.service.compare_runs("run-1", "run-1")
+        self.assertEqual({"shared": 3, "left_only": 0, "right_only": 0, "union": 3}, payload["counts"])
+        self.assertEqual([], payload["left_only"])
+        self.assertEqual([], payload["right_only"])
+        self.assertEqual(
+            [("chr1", 11856378), ("chr17", 43093445), ("chr7", 55019017)],
+            [(allele["chrom"], allele["pos"]) for allele in payload["shared"]],
+        )
+        self.assertEqual(3, payload["left"]["allele_count"])
+        self.assertEqual(3, payload["right"]["allele_count"])
+        self.assertEqual("run-1", payload["left"]["run_id"])
+        self.assertEqual("run-1", payload["right"]["run_id"])
+
+    def test_compare_deduplicates_allele_identity_within_one_run(self):
+        vcf = "\n".join(
+            [
+                PREAMBLE,
+                HEADER,
+                "chr1\t100\t.\tA\tG\t60\tPASS\tDP=10",
+                "chr1\t100\t.\tA\tG,T\t60\tPASS\tDP=10",
+            ]
+        ) + "\n"
+        self.sample(key="s1", vcf=vcf)
+        self.start_run(key="r1")
+        payload = self.service.compare_runs("run-1", "run-1")
+        # Three annotation rows collapse to two distinct identities.
+        self.assertEqual(2, payload["left"]["allele_count"])
+        self.assertEqual({"shared": 2, "left_only": 0, "right_only": 0, "union": 2}, payload["counts"])
+        self.assertEqual([("A", "G"), ("A", "T")], [(a["ref"], a["alt"]) for a in payload["shared"]])
+
+    def test_compare_missing_run_is_not_found(self):
+        self._comparable_runs()
+        with self.assertRaisesRegex(NotFoundError, r"^run missing was not found$"):
+            self.service.compare_runs("missing", "run-2")
+        with self.assertRaisesRegex(NotFoundError, r"^run other was not found$"):
+            self.service.compare_runs("run-1", "other")
+
+    def test_compare_does_not_modify_either_run(self):
+        self._comparable_runs()
+        before_left = self.service._document("run-1")
+        before_right = self.service._document("run-2")
+        self.service.compare_runs("run-1", "run-2")
+        self.service.compare_runs("run-2", "run-1")
+        self.assertEqual(before_left, self.service._document("run-1"))
+        self.assertEqual(before_right, self.service._document("run-2"))
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+        self.assertTrue(self.service.run_provenance("run-2")["verified"])
+
+    def test_compare_reverse_direction_swaps_the_sides(self):
+        self._comparable_runs()
+        forward = self.service.compare_runs("run-1", "run-2")
+        reverse = self.service.compare_runs("run-2", "run-1")
+        self.assertEqual(forward["left"], reverse["right"])
+        self.assertEqual(forward["right"], reverse["left"])
+        self.assertEqual(forward["left_only"], reverse["right_only"])
+        self.assertEqual(forward["right_only"], reverse["left_only"])
+        self.assertEqual(forward["shared"], reverse["shared"])
+        self.assertEqual(forward["counts"]["union"], reverse["counts"]["union"])
+
+
+class CompareHttpTests(unittest.TestCase):
+    COMPARE_LEFT = "\n".join(
+        [
+            PREAMBLE,
+            HEADER,
+            "chr1\t11856378\t.\tG\tA\t60\tPASS\tDP=10",
+            "chr17\t43093445\t.\tC\tT\t60\tPASS\tDP=10",
+        ]
+    ) + "\n"
+    COMPARE_RIGHT = "\n".join(
+        [
+            PREAMBLE,
+            HEADER,
+            "chr1\t11856378\t.\tG\tA\t60\tPASS\tDP=10",
+            "chr12\t25245350\t.\tC\tA\t60\tPASS\tDP=10",
+        ]
+    ) + "\n"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": self.COMPARE_LEFT}, "s1")
+        service.create_sample({"id": "s2", "vcf": self.COMPARE_RIGHT}, "s2")
+        service.create_run("s1", {"id": "run-1"}, "r1")
+        service.create_run("s2", {"id": "run-2"}, "r2")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_compare_endpoint_succeeds_without_idempotency_key(self):
+        status, content_type, body = self.get("/runs/run-1/compare/run-2")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual({"shared": 1, "left_only": 1, "right_only": 1, "union": 3}, payload["counts"])
+        self.assertEqual("run-1", payload["left"]["run_id"])
+        self.assertEqual("run-2", payload["right"]["run_id"])
+        self.assertEqual("chr17", payload["left_only"][0]["chrom"])
+        self.assertEqual("chr12", payload["right_only"][0]["chrom"])
+        # GET comparison needs no special headers; repeating it is verbatim stable.
+        self.assertEqual(body, self.get("/runs/run-1/compare/run-2")[2])
+
+    def test_compare_endpoint_missing_run_is_404(self):
+        status, content_type, body = self.get("/runs/missing/compare/run-2")
+        self.assertEqual(404, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+        status, _, body = self.get("/runs/run-1/compare/missing")
+        self.assertEqual(404, status)
+        self.assertEqual("run missing was not found", json.loads(body)["error"]["message"])
+
+    def test_compare_route_shape_is_enforced(self):
+        status, _, body = self.get("/runs/run-1/compare")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
+
 
 class ExportHttpTests(unittest.TestCase):
     def setUp(self):

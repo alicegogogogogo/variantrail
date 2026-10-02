@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .compare import compare_documents
 from .errors import ConflictError, NotFoundError, ValidationError
 from .export import render_jsonl, render_tsv
 from .model import identifier, run_view, sample_view
@@ -139,6 +140,12 @@ class VariantRail:
             "steps": document["provenance"],
             "verified": chain_verified and reproduction_verified,
         }
+
+    def compare_runs(self, run_id: str, other_run_id: str) -> dict[str, Any]:
+        """Compare the retained alleles of two runs without recomputing either."""
+        left = self._document(run_id)
+        right = self._document(other_run_id)
+        return compare_documents(left, right)
 
     def _document(self, run_id: str) -> dict[str, Any]:
         row = self.store.connection.execute("SELECT document FROM runs WHERE id = ?", (run_id,)).fetchone()
