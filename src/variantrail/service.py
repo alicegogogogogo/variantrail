@@ -154,6 +154,81 @@ class VariantRail:
             "shared": shared,
         }
 
+    def cohort_runs(self, run_id: str, others: str | None) -> dict[str, Any]:
+        """Compare the retained ALT alleles of two or more runs; read-only."""
+        run_ids = [run_id] + (others.split(",") if others else [])
+        if len(run_ids) < 2:
+            raise ValidationError("cohort requires at least two distinct runs")
+        if len(set(run_ids)) != len(run_ids):
+            raise ConflictError("cohort run ids must be distinct")
+        documents = [self._document(identifier) for identifier in run_ids]
+        run_count = len(run_ids)
+        per_run = [_alleles(document) for document in documents]
+
+        union: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+        for alleles in per_run:
+            for key, allele in alleles.items():
+                union.setdefault(key, allele)
+
+        rows: list[dict[str, Any]] = []
+        frequency: dict[int, int] = {}
+        private: dict[str, int] = {identifier: 0 for identifier in run_ids}
+        for key in sorted(union):
+            present_in = [run_ids[index] for index, alleles in enumerate(per_run) if key in alleles]
+            count = len(present_in)
+            frequency[count] = frequency.get(count, 0) + 1
+            if count == 1:
+                private[present_in[0]] += 1
+            source = union[key]
+            rows.append(
+                {
+                    "chrom": source["chrom"],
+                    "pos": source["pos"],
+                    "ref": source["ref"],
+                    "alt": source["alt"],
+                    "gene": source["gene"],
+                    "consequence": source["consequence"],
+                    "impact": source["impact"],
+                    "run_count": count,
+                    "present_in": present_in,
+                }
+            )
+
+        unique_alleles = len(rows)
+        core_alleles = frequency.get(run_count, 0)
+        private_alleles = frequency.get(1, 0)
+        variable_alleles = unique_alleles - core_alleles - private_alleles
+
+        def cohort_summary(key_of: Callable[[dict[str, Any]], str]) -> dict[str, Any]:
+            """Per-key unique/core/variable allele counts, keys sorted."""
+            counts: dict[str, dict[str, int]] = {}
+            for allele in rows:
+                entry = counts.setdefault(
+                    key_of(allele),
+                    {"unique_alleles": 0, "core_alleles": 0, "variable_alleles": 0},
+                )
+                entry["unique_alleles"] += 1
+                if allele["run_count"] == run_count:
+                    entry["core_alleles"] += 1
+                elif 1 < allele["run_count"] < run_count:
+                    entry["variable_alleles"] += 1
+            return {key: counts[key] for key in sorted(counts)}
+
+        return {
+            "run_count": run_count,
+            "runs": [_side(identifier, document, alleles) for identifier, document, alleles in zip(run_ids, documents, per_run)],
+            "alleles": rows,
+            "counts": {
+                "unique_alleles": unique_alleles,
+                "core_alleles": core_alleles,
+                "variable_alleles": variable_alleles,
+                "private_alleles": {identifier: private[identifier] for identifier in run_ids},
+            },
+            "frequency_summary": {str(number): frequency.get(number, 0) for number in range(1, run_count + 1)},
+            "gene_summary": cohort_summary(lambda allele: allele["gene"] or "NA"),
+            "impact_summary": cohort_summary(lambda allele: allele["impact"]),
+        }
+
     def run_provenance(self, run_id: str) -> dict[str, Any]:
         document = self._document(run_id)
         sample = self.get_sample(document["sample_id"])

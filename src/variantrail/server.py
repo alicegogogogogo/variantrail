@@ -64,6 +64,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, RawBody(content_type, body)
         if len(parts) == 4 and parts[0] == "runs" and parts[2] == "compare" and self.command == "GET":
             return 200, self.service.compare_runs(parts[1], parts[3])
+        if len(parts) == 4 and parts[0] == "runs" and parts[2] == "cohort" and self.command == "GET":
+            return 200, self.service.cohort_runs(parts[1], parts[3])
+        if len(parts) == 3 and parts[0] == "runs" and parts[2] == "cohort" and self.command == "GET":
+            return 200, self.service.cohort_runs(parts[1], None)
         if len(parts) == 3 and parts[0] == "runs" and parts[2] == "provenance" and self.command == "GET":
             return 200, self.service.run_provenance(parts[1])
         raise NotFoundError("route was not found")
