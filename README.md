@@ -34,8 +34,8 @@ has bound the port.
 
 ## HTTP API
 
-All request and response bodies are JSON except the `jsonl` and `tsv` run
-export endpoints, and unknown fields are rejected. Both `POST` endpoints
+All request and response bodies are JSON except the `jsonl`, `tsv` and `vcf`
+run export endpoints, and unknown fields are rejected. Both `POST` endpoints
 require an `Idempotency-Key` header; repeating a key returns the stored first
 response verbatim, and reusing a key for another operation is a `conflict`.
 
@@ -182,7 +182,8 @@ is the 1-based VCF ALT index.
 
 ### Export run results
 
-`GET /runs/run-1/exports/jsonl` and `GET /runs/run-1/exports/tsv` hand the
+`GET /runs/run-1/exports/jsonl`, `GET /runs/run-1/exports/tsv` and
+`GET /runs/run-1/exports/vcf` hand the
 retained variants of a saved run to downstream analysis as a stable payload.
 The body is generated on demand from the stored run; it is never written to
 disk, and the run, its variants and its provenance are not modified.
@@ -213,8 +214,23 @@ Formatting rules:
 - numbers use the JSON decimal representation and text is not quoted.
 
 A run with no variants returns just the header line. An unknown `run_id`
-returns 404 `not_found`; any `format` other than `jsonl` or `tsv` returns 400
-`validation_error`, both with the standard error object.
+returns 404 `not_found`; any `format` other than `jsonl`, `tsv` or `vcf`
+returns 400 `validation_error`, both with the standard error object.
+
+`vcf` is served as `text/x-variant-call-format; charset=utf-8`: the retained
+variants rendered back as VCF v4.2 text (UTF-8, LF line endings). The header
+opens with `##fileformat=VCFv4.2`, repeats the uploaded sample's other meta
+lines in their original order, adds `##source=variantrail`, and declares four
+export INFO keys — `ALLELE_INDEX` (Integer), `VT_GENE`, `VT_CONSEQUENCE` and
+`VT_IMPACT` (String, all `Number=1`) — before the tab-separated
+`#CHROM POS ID REF ALT QUAL FILTER INFO` column header. Each retained ALT
+allele is one record, in variant file order and `allele_index` order, with
+`ALT` holding only the current allele. `ID`, `QUAL` and an empty `FILTER` are
+`.` when missing; `INFO` lists the original entries sorted by key, then the
+four export keys (`VT_GENE` is `NA` when no gene is annotated). If an original
+INFO field uses `ALLELE_INDEX` or one of the `VT_*` keys, the export returns
+400 `validation_error` naming the conflicting key. A run with no variants
+returns just the header, and repeated requests are byte-identical.
 
 ### Compare two runs
 

@@ -599,9 +599,100 @@ class VariantRailTests(unittest.TestCase):
         before = self.service._document("run-1")
         self.service.run_export("run-1", "tsv")
         self.service.run_export("run-1", "jsonl")
+        self.service.run_export("run-1", "vcf")
         after = self.service._document("run-1")
         self.assertEqual(before, after)
         self.assertTrue(self.service.run_provenance("run-1")["verified"])
+
+    def test_vcf_export_header_and_one_record_per_retained_allele(self):
+        self.sample()
+        self.start_run()
+        content_type, body = self.service.run_export("run-1", "vcf")
+        self.assertEqual("text/x-variant-call-format; charset=utf-8", content_type)
+        text = body.decode("utf-8")
+        self.assertNotIn("\r", text)
+        lines = text.split("\n")
+        self.assertEqual("", lines[-1])  # exactly one trailing LF
+        self.assertEqual(
+            [
+                "##fileformat=VCFv4.2",
+                "##reference=GRCh38",
+                "##contig=<ID=chr1>",
+                "##source=variantrail",
+                '##INFO=<ID=ALLELE_INDEX,Number=1,Type=Integer,Description="1-based index of the ALT allele in the source record">',
+                '##INFO=<ID=VT_GENE,Number=1,Type=String,Description="Annotated gene symbol, NA when unannotated">',
+                '##INFO=<ID=VT_CONSEQUENCE,Number=1,Type=String,Description="Annotated sequence consequence">',
+                '##INFO=<ID=VT_IMPACT,Number=1,Type=String,Description="Annotated impact">',
+                HEADER,
+            ],
+            lines[:9],
+        )
+        rows = lines[9:-1]
+        self.assertEqual(8, len(rows))  # seven records, one with two ALTs
+        self.assertEqual(
+            "chr1\t11856378\trs1\tG\tA\t60.0\tPASS\tDP=42;ALLELE_INDEX=1;VT_GENE=MTHFR;VT_CONSEQUENCE=missense_variant;VT_IMPACT=MODERATE",
+            rows[0],
+        )
+        # Empty original INFO, missing ID.
+        self.assertEqual(
+            "chr7\t55019017\t.\tG\tT\t50.0\tPASS\tALLELE_INDEX=1;VT_GENE=EGFR;VT_CONSEQUENCE=stop_gained;VT_IMPACT=HIGH",
+            rows[4],
+        )
+        # Multi-ALT record: one row per allele, allele_index order, ALT holds only the current allele.
+        self.assertEqual(
+            "chr12\t25245350\t.\tC\tA\t80.0\tPASS\tDP=60;ALLELE_INDEX=1;VT_GENE=KRAS;VT_CONSEQUENCE=missense_variant;VT_IMPACT=MODERATE",
+            rows[5],
+        )
+        self.assertEqual(
+            "chr12\t25245350\t.\tC\tT\t80.0\tPASS\tDP=60;ALLELE_INDEX=2;VT_GENE=KRAS;VT_CONSEQUENCE=missense_variant;VT_IMPACT=MODERATE",
+            rows[6],
+        )
+
+    def test_vcf_export_renders_nulls_sorted_info_and_na_gene(self):
+        vcf = single(pos=11856379, ref="A", alt="G", qual=".", filter_value="q10;S50", info="DP=7;ZZ=1;AA=2;FLAG")
+        self.sample(vcf=vcf)
+        self.start_run()
+        _, body = self.service.run_export("run-1", "vcf")
+        row = body.decode("utf-8").split("\n")[9]
+        self.assertEqual(
+            "chr1\t11856379\t.\tA\tG\t.\tq10;S50\tAA=2;DP=7;FLAG;ZZ=1;ALLELE_INDEX=1;VT_GENE=NA;VT_CONSEQUENCE=intergenic_variant;VT_IMPACT=MODIFIER",
+            row,
+        )
+
+    def test_vcf_export_empty_run_returns_header_only(self):
+        self.sample()
+        self.start_run({"genes": ["NO_SUCH_GENE"]})
+        status_body = self.service.run_export("run-1", "vcf")[1]
+        text = status_body.decode("utf-8")
+        self.assertTrue(text.endswith("\n"))
+        self.assertNotIn("\n\n", text)
+        lines = text.split("\n")
+        self.assertEqual("", lines[-1])
+        self.assertEqual(HEADER, lines[-2])
+        self.assertEqual(9, len(lines) - 1)  # header lines plus column header only
+
+    def test_vcf_export_is_byte_identical_across_requests(self):
+        self.sample()
+        self.start_run()
+        _, first = self.service.run_export("run-1", "vcf")
+        _, second = self.service.run_export("run-1", "vcf")
+        self.assertEqual(first, second)
+
+    def test_vcf_export_rejects_reserved_info_keys(self):
+        for key in ("ALLELE_INDEX", "VT_GENE", "VT_CONSEQUENCE", "VT_IMPACT"):
+            with self.subTest(key=key):
+                self.sample(vcf=single(info=f"DP=42;{key}=1"), key=f"s-{key}", sample_id=f"s-{key}")
+                self.start_run(key=f"r-{key}", run_id=f"run-{key}", sample_id=f"s-{key}")
+                with self.assertRaisesRegex(ValidationError, key):
+                    self.service.run_export(f"run-{key}", "vcf")
+
+    def test_vcf_export_validates_format_and_run_existence(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(ValidationError, "jsonl, tsv, vcf"):
+            self.service.run_export("run-1", "csv")
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.run_export("missing", "vcf")
 
 
 class ExportHttpTests(unittest.TestCase):
@@ -643,15 +734,27 @@ class ExportHttpTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("text/tab-separated-values; charset=utf-8", content_type)
         self.assertEqual(TSV_HEADER, body.decode("utf-8").split("\n")[0])
+        status, content_type, body = self.get("/runs/run-1/exports/vcf")
+        self.assertEqual(200, status)
+        self.assertEqual("text/x-variant-call-format; charset=utf-8", content_type)
+        lines = body.decode("utf-8").split("\n")
+        self.assertEqual("##fileformat=VCFv4.2", lines[0])
+        self.assertEqual(HEADER, lines[8])
+        self.assertEqual(8, len(lines) - 10)  # eight retained alleles, one trailing LF
 
     def test_export_errors_use_the_standard_error_object(self):
         status, content_type, body = self.get("/runs/missing/exports/tsv")
         self.assertEqual(404, status)
         self.assertEqual("application/json; charset=utf-8", content_type)
         self.assertEqual("not_found", json.loads(body)["error"]["code"])
+        status, _, body = self.get("/runs/missing/exports/vcf")
+        self.assertEqual(404, status)
+        self.assertEqual("run missing was not found", json.loads(body)["error"]["message"])
         status, _, body = self.get("/runs/run-1/exports/csv")
         self.assertEqual(400, status)
-        self.assertEqual("validation_error", json.loads(body)["error"]["code"])
+        error = json.loads(body)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertEqual("format must be one of jsonl, tsv, vcf", error["message"])
         status, _, body = self.get("/runs/run-1/exports")
         self.assertEqual(404, status)
         self.assertEqual("not_found", json.loads(body)["error"]["code"])

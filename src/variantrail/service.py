@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .export import render_jsonl, render_tsv
+from .export import render_jsonl, render_tsv, render_vcf
 from .model import identifier, run_view, sample_view
 from .pipeline import execute, normalize_params
 from .provenance import digest_text, verify_chain
@@ -116,8 +116,13 @@ class VariantRail:
             content_type = "text/tab-separated-values; charset=utf-8"
             variants = self._document(run_id)["variants"]
             body = render_tsv(variants)
+        elif format == "vcf":
+            content_type = "text/x-variant-call-format; charset=utf-8"
+            document = self._document(run_id)
+            sample = self.get_sample(document["sample_id"])
+            body = render_vcf(document["variants"], sample["meta"])
         else:
-            raise ValidationError("format must be one of jsonl, tsv")
+            raise ValidationError("format must be one of jsonl, tsv, vcf")
         return content_type, body
 
     def compare_runs(self, run_id: str, other_run_id: str) -> dict[str, Any]:
