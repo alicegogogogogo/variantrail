@@ -391,6 +391,135 @@ class VariantRailTests(unittest.TestCase):
             self.service.run_provenance("run-2")["steps"],
         )
 
+    # --- comparison --------------------------------------------------------
+
+    def test_compare_partitions_alleles_into_shared_and_left_only(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["HIGH"]}, key="r2", run_id="run-2")
+        payload = self.service.compare_runs("run-1", "run-2")
+        self.assertEqual(
+            {"left_only": 4, "right_only": 0, "shared": 4, "union": 8},
+            payload["counts"],
+        )
+        self.assertEqual(8, payload["left"]["allele_count"])
+        self.assertEqual(4, payload["right"]["allele_count"])
+        self.assertEqual("run-1", payload["left"]["run_id"])
+        self.assertEqual("run-2", payload["right"]["run_id"])
+        self.assertEqual("s1", payload["left"]["sample_id"])
+        self.assertEqual(
+            self.service.get_run("run-1")["sample_sha256"], payload["left"]["sample_sha256"]
+        )
+        self.assertEqual(
+            [
+                ("chr1", 11856378, "G", "T"),
+                ("chr17", 43093445, "C", "T"),
+                ("chr7", 55019017, "G", "GA"),
+                ("chr7", 55019017, "G", "T"),
+            ],
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in payload["shared"]],
+        )
+        self.assertEqual(
+            [
+                ("chr1", 11856378, "G", "A"),
+                ("chr1", 11856379, "A", "G"),
+                ("chr12", 25245350, "C", "A"),
+                ("chr12", 25245350, "C", "T"),
+            ],
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in payload["left_only"]],
+        )
+        self.assertEqual([], payload["right_only"])
+        entry = payload["shared"][0]
+        self.assertEqual(
+            {"alt", "chrom", "consequence", "gene", "impact", "pos", "ref"}, set(entry)
+        )
+        self.assertEqual("MTHFR", entry["gene"])
+        self.assertEqual("stop_gained", entry["consequence"])
+        self.assertEqual("HIGH", entry["impact"])
+        self.assertIsNone(payload["left_only"][1]["gene"])
+
+    def test_compare_summaries_group_by_gene_and_impact(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["HIGH"]}, key="r2", run_id="run-2")
+        payload = self.service.compare_runs("run-1", "run-2")
+        self.assertEqual(
+            {
+                "BRCA1": {"left_only": 0, "right_only": 0, "shared": 1},
+                "EGFR": {"left_only": 0, "right_only": 0, "shared": 2},
+                "KRAS": {"left_only": 2, "right_only": 0, "shared": 0},
+                "MTHFR": {"left_only": 1, "right_only": 0, "shared": 1},
+                "NA": {"left_only": 1, "right_only": 0, "shared": 0},
+            },
+            payload["gene_summary"],
+        )
+        self.assertEqual(
+            {
+                "HIGH": {"left_only": 0, "right_only": 0, "shared": 4},
+                "MODERATE": {"left_only": 3, "right_only": 0, "shared": 0},
+                "MODIFIER": {"left_only": 1, "right_only": 0, "shared": 0},
+            },
+            payload["impact_summary"],
+        )
+        self.assertEqual(sorted(payload["gene_summary"]), list(payload["gene_summary"]))
+        self.assertEqual(sorted(payload["impact_summary"]), list(payload["impact_summary"]))
+
+    def test_compare_is_symmetric_and_byte_stable(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["HIGH"]}, key="r2", run_id="run-2")
+        forward = self.service.compare_runs("run-1", "run-2")
+        reverse = self.service.compare_runs("run-2", "run-1")
+        self.assertEqual(forward["shared"], reverse["shared"])
+        self.assertEqual(forward["left_only"], reverse["right_only"])
+        self.assertEqual(forward["right_only"], reverse["left_only"])
+        self.assertEqual(forward["counts"]["union"], reverse["counts"]["union"])
+        self.assertEqual(forward, self.service.compare_runs("run-1", "run-2"))
+
+    def test_compare_same_run_reports_everything_shared(self):
+        self.sample()
+        self.start_run()
+        payload = self.service.compare_runs("run-1", "run-1")
+        self.assertEqual(
+            {"left_only": 0, "right_only": 0, "shared": 8, "union": 8},
+            payload["counts"],
+        )
+        self.assertEqual([], payload["left_only"])
+        self.assertEqual([], payload["right_only"])
+        self.assertEqual(8, len(payload["shared"]))
+
+    def test_compare_works_across_samples(self):
+        self.sample(key="s1", sample_id="s1")
+        self.sample(key="s2", sample_id="s2", vcf=single(pos=5227002, chrom="chr11", ref="T", alt="C"))
+        self.start_run(key="r1", run_id="run-1", sample_id="s1")
+        self.start_run(key="r2", run_id="run-2", sample_id="s2")
+        payload = self.service.compare_runs("run-1", "run-2")
+        self.assertEqual("s1", payload["left"]["sample_id"])
+        self.assertEqual("s2", payload["right"]["sample_id"])
+        self.assertNotEqual(payload["left"]["sample_sha256"], payload["right"]["sample_sha256"])
+        self.assertEqual({"left_only": 8, "right_only": 1, "shared": 0, "union": 9}, payload["counts"])
+        self.assertEqual("HBB", payload["right_only"][0]["gene"])
+
+    def test_compare_missing_run_is_not_found(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.compare_runs("run-1", "missing")
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.compare_runs("missing", "run-1")
+
+    def test_compare_does_not_modify_runs_or_provenance(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["HIGH"]}, key="r2", run_id="run-2")
+        before_left = self.service._document("run-1")
+        before_right = self.service._document("run-2")
+        self.service.compare_runs("run-1", "run-2")
+        self.assertEqual(before_left, self.service._document("run-1"))
+        self.assertEqual(before_right, self.service._document("run-2"))
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+        self.assertTrue(self.service.run_provenance("run-2")["verified"])
+
     # --- exports -----------------------------------------------------------
 
     def test_jsonl_export_has_one_canonical_object_per_line_in_file_order(self):
@@ -524,6 +653,67 @@ class ExportHttpTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("validation_error", json.loads(body)["error"]["code"])
         status, _, body = self.get("/runs/run-1/exports")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
+
+
+class CompareHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1"}, "r1")
+        service.create_run("s1", {"id": "run-2", "params": {"impacts": ["HIGH"]}}, "r2")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_compare_endpoint_returns_the_comparison(self):
+        status, content_type, body = self.get("/runs/run-1/compare/run-2")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual({"left_only": 4, "right_only": 0, "shared": 4, "union": 8}, payload["counts"])
+        self.assertEqual("run-1", payload["left"]["run_id"])
+        self.assertEqual("run-2", payload["right"]["run_id"])
+        self.assertEqual(4, len(payload["shared"]))
+        self.assertEqual(4, len(payload["left_only"]))
+        self.assertEqual([], payload["right_only"])
+        # Repeated requests are byte-for-byte identical.
+        _, _, again = self.get("/runs/run-1/compare/run-2")
+        self.assertEqual(body, again)
+
+    def test_compare_endpoint_errors_use_the_standard_error_object(self):
+        status, content_type, body = self.get("/runs/run-1/compare/missing")
+        self.assertEqual(404, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+        status, _, body = self.get("/runs/missing/compare/run-1")
+        self.assertEqual(404, status)
+        self.assertEqual("run missing was not found", json.loads(body)["error"]["message"])
+        status, _, body = self.get("/runs/run-1/compare")
         self.assertEqual(404, status)
         self.assertEqual("not_found", json.loads(body)["error"]["code"])
 

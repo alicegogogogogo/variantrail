@@ -120,6 +120,35 @@ class VariantRail:
             raise ValidationError("format must be one of jsonl, tsv")
         return content_type, body
 
+    def compare_runs(self, run_id: str, other_run_id: str) -> dict[str, Any]:
+        """Compare the retained ALT alleles of two finished runs; read-only."""
+        left = self._document(run_id)
+        right = self._document(other_run_id)
+        left_alleles = _alleles(left)
+        right_alleles = _alleles(right)
+        shared_keys = left_alleles.keys() & right_alleles.keys()
+        left_only_keys = left_alleles.keys() - right_alleles.keys()
+        right_only_keys = right_alleles.keys() - left_alleles.keys()
+        shared = _pick(left_alleles, shared_keys)
+        left_only = _pick(left_alleles, left_only_keys)
+        right_only = _pick(right_alleles, right_only_keys)
+        buckets = (("shared", shared), ("left_only", left_only), ("right_only", right_only))
+        return {
+            "counts": {
+                "left_only": len(left_only),
+                "right_only": len(right_only),
+                "shared": len(shared),
+                "union": len(shared) + len(left_only) + len(right_only),
+            },
+            "gene_summary": _summary(buckets, lambda allele: allele["gene"] or "NA"),
+            "impact_summary": _summary(buckets, lambda allele: allele["impact"]),
+            "left": _side(run_id, left, left_alleles),
+            "left_only": left_only,
+            "right": _side(other_run_id, right, right_alleles),
+            "right_only": right_only,
+            "shared": shared,
+        }
+
     def run_provenance(self, run_id: str) -> dict[str, Any]:
         document = self._document(run_id)
         sample = self.get_sample(document["sample_id"])
@@ -145,3 +174,46 @@ class VariantRail:
         if not row:
             raise NotFoundError(f"run {run_id} was not found")
         return self.store.decode(row["document"])
+
+
+def _alleles(document: dict[str, Any]) -> dict[tuple[str, int, str, str], dict[str, Any]]:
+    """Distinct retained ALT alleles of a run, keyed by (chrom, pos, ref, alt)."""
+    alleles: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+    for variant in document["variants"]:
+        for annotation in variant["annotations"]:
+            key = (variant["chrom"], variant["pos"], variant["ref"], annotation["allele"])
+            if key not in alleles:
+                alleles[key] = {
+                    "alt": annotation["allele"],
+                    "chrom": variant["chrom"],
+                    "consequence": annotation["consequence"],
+                    "gene": annotation["gene"],
+                    "impact": annotation["impact"],
+                    "pos": variant["pos"],
+                    "ref": variant["ref"],
+                }
+    return alleles
+
+
+def _pick(alleles: dict[tuple[str, int, str, str], dict[str, Any]], keys: Any) -> list[dict[str, Any]]:
+    """Alleles for the given identities, sorted by chrom, pos, ref, alt."""
+    return [alleles[key] for key in sorted(keys)]
+
+
+def _side(run_id: str, document: dict[str, Any], alleles: dict[Any, Any]) -> dict[str, Any]:
+    return {
+        "allele_count": len(alleles),
+        "run_id": run_id,
+        "sample_id": document["sample_id"],
+        "sample_sha256": document["sample_sha256"],
+    }
+
+
+def _summary(buckets: Any, key_of: Callable[[dict[str, Any]], str]) -> dict[str, Any]:
+    """Per-key allele counts in each comparison bucket, keys sorted."""
+    counts: dict[str, dict[str, int]] = {}
+    for bucket, alleles in buckets:
+        for allele in alleles:
+            entry = counts.setdefault(key_of(allele), {"left_only": 0, "right_only": 0, "shared": 0})
+            entry[bucket] += 1
+    return {key: counts[key] for key in sorted(counts)}

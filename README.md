@@ -216,6 +216,44 @@ A run with no variants returns just the header line. An unknown `run_id`
 returns 404 `not_found`; any `format` other than `jsonl` or `tsv` returns 400
 `validation_error`, both with the standard error object.
 
+### Compare two runs
+
+`GET /runs/{run_id}/compare/{other_run_id}` compares the retained ALT alleles
+of two finished runs — `run_id` on the left, `other_run_id` on the right. It
+only reads the stored runs: no pipeline step is re-executed and neither run,
+its variants, its exports, nor its provenance is modified. The runs may belong
+to different samples. No `Idempotency-Key` is required.
+
+An allele's identity is the tuple `(chrom, pos, ref, alt)`; duplicates of the
+same identity within one run count once. Returns HTTP 200:
+
+```json
+{"left":{"run_id":"run-1","sample_id":"trio-1","sample_sha256":"...","allele_count":8},
+ "right":{"run_id":"run-2","sample_id":"trio-1","sample_sha256":"...","allele_count":4},
+ "counts":{"shared":4,"left_only":4,"right_only":0,"union":8},
+ "shared":[{"chrom":"chr1","pos":11856378,"ref":"G","alt":"T",
+   "gene":"MTHFR","consequence":"stop_gained","impact":"HIGH"}],
+ "left_only":[...],
+ "right_only":[...],
+ "gene_summary":{"MTHFR":{"shared":1,"left_only":1,"right_only":0}},
+ "impact_summary":{"HIGH":{"shared":4,"left_only":0,"right_only":0}}}
+```
+
+- `shared`, `left_only` and `right_only` hold every distinct allele on both
+  sides, on the left only, and on the right only; each element carries
+  `chrom`, `pos`, `ref`, `alt`, `gene`, `consequence` and `impact`, with
+  `gene` kept as JSON `null` when the allele has no table match. Comparing a
+  run with itself puts every allele in `shared`.
+- Each array is sorted by `chrom` (text order), then `pos` (numeric), then
+  `ref`, then `alt`, so repeated requests are byte-for-byte identical.
+- `counts` mirrors the three array lengths plus `union`, their total.
+- `gene_summary` and `impact_summary` count the alleles of each bucket per
+  gene and per impact; keys are sorted lexicographically, a `null` gene
+  appears as `NA`, and impacts keep their original values.
+
+An unknown `run_id` or `other_run_id` returns 404 `not_found` with the
+message `run <run_id> was not found`.
+
 ### The annotation table
 
 Annotation matches the exact tuple `(CHROM, POS, REF, ALT)`. A variant with no
