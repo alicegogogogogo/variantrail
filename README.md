@@ -270,6 +270,69 @@ same identity within one run count once. Returns HTTP 200:
 An unknown `run_id` or `other_run_id` returns 404 `not_found` with the
 message `run <run_id> was not found`.
 
+### Compare a cohort of runs
+
+`GET /runs/{run_id}/cohort/{other_run_ids}` compares the retained ALT alleles
+of two or more finished runs at once. `other_run_ids` is two or more run ids
+joined with commas; the path order (the path `run_id` first, then the comma
+list) is the cohort queue order. Like the two-run comparison it only reads the
+stored runs: no pipeline step is re-executed and no run, variant, export or
+provenance record is modified. No `Idempotency-Key` is required.
+
+An allele's identity is again `(chrom, pos, ref, alt)`; duplicates of the same
+identity within one run count once, and annotations are taken as stored — no
+filtering or re-annotation happens. Returns HTTP 200:
+
+```json
+{"run_count":3,
+ "runs":[{"run_id":"run-1","sample_id":"trio-1","sample_sha256":"...","allele_count":8},
+         {"run_id":"run-2","sample_id":"trio-1","sample_sha256":"...","allele_count":4},
+         {"run_id":"run-3","sample_id":"trio-2","sample_sha256":"...","allele_count":3}],
+ "alleles":[{"chrom":"chr1","pos":11856378,"ref":"G","alt":"A","gene":"MTHFR",
+   "consequence":"missense_variant","impact":"MODERATE","run_count":2,
+   "present_in":["run-1","run-3"]}],
+ "counts":{"unique_alleles":9,"core_alleles":2,"variable_alleles":3,
+   "private_alleles":{"run-1":3,"run-2":1,"run-3":0}},
+ "frequency_summary":{"1":4,"2":3,"3":2},
+ "gene_summary":{"BRCA1":{"unique_alleles":1,"core_alleles":1,"variable_alleles":0},
+                "MTHFR":{"unique_alleles":2,"core_alleles":0,"variable_alleles":2}},
+ "impact_summary":{"HIGH":{"unique_alleles":4,"core_alleles":2,"variable_alleles":2}}}
+```
+
+- `runs` repeats the queued runs in queue order; each entry has `run_id`,
+  `sample_id`, `sample_sha256` and `allele_count`, the number of distinct
+  retained alleles in that run.
+- `alleles` holds every distinct allele of the union (different ALTs at the
+  same coordinate are separate entries). Each element carries `chrom`, `pos`,
+  `ref`, `alt`, `gene` (`null` when the allele has no table match),
+  `consequence`, `impact`, `run_count` — the number of cohort runs containing
+  it — and `present_in`, the run ids of those runs in queue order. The array
+  is sorted by `chrom` (text order), then `pos` (numeric), then `ref`, then
+  `alt`, so repeated requests are byte-for-byte identical.
+- `counts.unique_alleles` is the total number of entries in `alleles`;
+  `core_alleles` counts alleles present in all `run_count` runs,
+  `variable_alleles` alleles present in between 2 and `run_count - 1` runs,
+  and `private_alleles` breaks the alleles present in exactly one run down by
+  `run_id`, in queue order (runs without a private allele show `0`).
+- `frequency_summary` has the string keys `"1"` through
+  `"<run_count>"` and counts alleles present in exactly that many runs, with
+  missing frequencies filled in as `0`.
+- `gene_summary` and `impact_summary` group `unique_alleles`, `core_alleles`
+  and `variable_alleles` per gene and per impact; a `null` gene appears as
+  `NA`, categories with no alleles are omitted, and keys are sorted
+  lexicographically. Private alleles are not separately listed there
+  (`unique = core + variable + private`).
+
+Changing the queue order returns the same data apart from the order of `runs`
+and of each `present_in`; the allele set, counts and summaries are unchanged,
+and repeating a request is byte-identical.
+
+Fewer than two run ids in the path is a 400 `validation_error` with the
+message `cohort requires at least two distinct runs`; a repeated run id is a
+409 `conflict` with the message `cohort run ids must be distinct`; any run id
+that does not exist is a 404 `not_found` with the message
+`run <run_id> was not found`.
+
 ### The annotation table
 
 Annotation matches the exact tuple `(CHROM, POS, REF, ALT)`. A variant with no

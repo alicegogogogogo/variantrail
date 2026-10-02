@@ -520,6 +520,198 @@ class VariantRailTests(unittest.TestCase):
         self.assertTrue(self.service.run_provenance("run-1")["verified"])
         self.assertTrue(self.service.run_provenance("run-2")["verified"])
 
+    # --- cohort comparison -------------------------------------------------
+
+    def _three_run_cohort_fixture(self):
+        # run-1 keeps all 8 alleles, run-2 keeps the 4 HIGH ones, run-3 the 2 EGFR ones.
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["HIGH"]}, key="r2", run_id="run-2")
+        self.start_run(params={"genes": ["EGFR"]}, key="r3", run_id="run-3")
+
+    def test_cohort_reports_run_order_and_allele_counts(self):
+        self._three_run_cohort_fixture()
+        payload = self.service.cohort_runs("run-1", "run-2,run-3")
+        self.assertEqual(3, payload["run_count"])
+        self.assertEqual(
+            [
+                ("run-1", "s1", 8),
+                ("run-2", "s1", 4),
+                ("run-3", "s1", 2),
+            ],
+            [(run["run_id"], run["sample_id"], run["allele_count"]) for run in payload["runs"]],
+        )
+        sample_sha = self.service.get_run("run-1")["sample_sha256"]
+        self.assertTrue(all(run["sample_sha256"] == sample_sha for run in payload["runs"]))
+        self.assertEqual(
+            {"run_id", "sample_id", "sample_sha256", "allele_count"},
+            set(payload["runs"][0]),
+        )
+        self.assertEqual(
+            {"unique_alleles": 8, "core_alleles": 2, "variable_alleles": 2,
+             "private_alleles": {"run-1": 4, "run-2": 0, "run-3": 0}},
+            payload["counts"],
+        )
+        self.assertEqual({"1": 4, "2": 2, "3": 2}, payload["frequency_summary"])
+
+    def test_cohort_alleles_are_sorted_with_present_in_in_queue_order(self):
+        self._three_run_cohort_fixture()
+        payload = self.service.cohort_runs("run-1", "run-2,run-3")
+        alleles = payload["alleles"]
+        self.assertEqual(
+            [
+                ("chr1", 11856378, "G", "A"),
+                ("chr1", 11856378, "G", "T"),
+                ("chr1", 11856379, "A", "G"),
+                ("chr12", 25245350, "C", "A"),
+                ("chr12", 25245350, "C", "T"),
+                ("chr17", 43093445, "C", "T"),
+                ("chr7", 55019017, "G", "GA"),
+                ("chr7", 55019017, "G", "T"),
+            ],
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in alleles],
+        )
+        by_identity = {(a["chrom"], a["pos"], a["ref"], a["alt"]): a for a in alleles}
+        self.assertEqual(
+            {"alt", "chrom", "consequence", "gene", "impact", "pos", "present_in", "ref", "run_count"},
+            set(alleles[0]),
+        )
+        # A private allele of run-1 keeps its stored annotation verbatim.
+        private = by_identity[("chr1", 11856378, "G", "A")]
+        self.assertEqual(1, private["run_count"])
+        self.assertEqual(["run-1"], private["present_in"])
+        self.assertEqual("MTHFR", private["gene"])
+        self.assertEqual("missense_variant", private["consequence"])
+        self.assertEqual("MODERATE", private["impact"])
+        # Variable allele is in run-1 and run-2; core allele is in all three, in queue order.
+        variable = by_identity[("chr1", 11856378, "G", "T")]
+        self.assertEqual(2, variable["run_count"])
+        self.assertEqual(["run-1", "run-2"], variable["present_in"])
+        core = by_identity[("chr7", 55019017, "G", "GA")]
+        self.assertEqual(3, core["run_count"])
+        self.assertEqual(["run-1", "run-2", "run-3"], core["present_in"])
+        # Unannotated allele keeps gene null.
+        self.assertIsNone(by_identity[("chr1", 11856379, "A", "G")]["gene"])
+
+    def test_cohort_summaries_group_by_gene_and_impact(self):
+        self._three_run_cohort_fixture()
+        payload = self.service.cohort_runs("run-1", "run-2,run-3")
+        self.assertEqual(
+            {
+                "BRCA1": {"unique_alleles": 1, "core_alleles": 0, "variable_alleles": 1},
+                "EGFR": {"unique_alleles": 2, "core_alleles": 2, "variable_alleles": 0},
+                "KRAS": {"unique_alleles": 2, "core_alleles": 0, "variable_alleles": 0},
+                "MTHFR": {"unique_alleles": 2, "core_alleles": 0, "variable_alleles": 1},
+                "NA": {"unique_alleles": 1, "core_alleles": 0, "variable_alleles": 0},
+            },
+            payload["gene_summary"],
+        )
+        self.assertEqual(
+            {
+                "HIGH": {"unique_alleles": 4, "core_alleles": 2, "variable_alleles": 2},
+                "MODERATE": {"unique_alleles": 3, "core_alleles": 0, "variable_alleles": 0},
+                "MODIFIER": {"unique_alleles": 1, "core_alleles": 0, "variable_alleles": 0},
+            },
+            payload["impact_summary"],
+        )
+        self.assertEqual(sorted(payload["gene_summary"]), list(payload["gene_summary"]))
+        self.assertEqual(sorted(payload["impact_summary"]), list(payload["impact_summary"]))
+
+    def test_cohort_reordering_only_changes_queue_order_and_is_byte_stable(self):
+        self._three_run_cohort_fixture()
+        forward = self.service.cohort_runs("run-1", "run-2,run-3")
+        reordered = self.service.cohort_runs("run-3", "run-1,run-2")
+        self.assertEqual(forward["run_count"], reordered["run_count"])
+        self.assertEqual(["run-1", "run-2", "run-3"], [run["run_id"] for run in forward["runs"]])
+        self.assertEqual(["run-3", "run-1", "run-2"], [run["run_id"] for run in reordered["runs"]])
+        self.assertEqual(
+            {(run["run_id"], run["allele_count"]) for run in forward["runs"]},
+            {(run["run_id"], run["allele_count"]) for run in reordered["runs"]},
+        )
+        self.assertEqual(
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in forward["alleles"]],
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in reordered["alleles"]],
+        )
+        by_identity_forward = {
+            (a["chrom"], a["pos"], a["ref"], a["alt"]): a for a in forward["alleles"]
+        }
+        by_identity_reordered = {
+            (a["chrom"], a["pos"], a["ref"], a["alt"]): a for a in reordered["alleles"]
+        }
+        for key, allele in by_identity_forward.items():
+            other = by_identity_reordered[key]
+            self.assertEqual(allele["run_count"], other["run_count"])
+            self.assertEqual(set(allele["present_in"]), set(other["present_in"]))
+        core_key = ("chr7", 55019017, "G", "GA")
+        self.assertEqual(["run-1", "run-2", "run-3"], by_identity_forward[core_key]["present_in"])
+        self.assertEqual(["run-3", "run-1", "run-2"], by_identity_reordered[core_key]["present_in"])
+        self.assertEqual(forward["counts"]["unique_alleles"], reordered["counts"]["unique_alleles"])
+        self.assertEqual(forward["counts"]["core_alleles"], reordered["counts"]["core_alleles"])
+        self.assertEqual(forward["counts"]["variable_alleles"], reordered["counts"]["variable_alleles"])
+        self.assertEqual(forward["counts"]["private_alleles"], reordered["counts"]["private_alleles"])
+        self.assertEqual(forward["frequency_summary"], reordered["frequency_summary"])
+        self.assertEqual(forward["gene_summary"], reordered["gene_summary"])
+        self.assertEqual(forward["impact_summary"], reordered["impact_summary"])
+        self.assertEqual(forward, self.service.cohort_runs("run-1", "run-2,run-3"))
+
+    def test_cohort_two_runs_matches_pair_semantics_with_zero_filled_frequency(self):
+        self._three_run_cohort_fixture()
+        payload = self.service.cohort_runs("run-1", "run-2")
+        self.assertEqual(2, payload["run_count"])
+        # run-1 has 4 alleles not in HIGH-only run-2; the other 4 are core at run_count 2.
+        self.assertEqual(
+            {"unique_alleles": 8, "core_alleles": 4, "variable_alleles": 0,
+             "private_alleles": {"run-1": 4, "run-2": 0}},
+            payload["counts"],
+        )
+        self.assertEqual({"1": 4, "2": 4}, payload["frequency_summary"])
+        for allele in payload["alleles"]:
+            self.assertIn(allele["run_count"], (1, 2))
+
+    def test_cohort_with_no_alleles_zero_fills_everything(self):
+        self.sample()
+        self.start_run(params={"genes": ["NO_SUCH_GENE"]}, key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["LOW"]}, key="r2", run_id="run-2")
+        payload = self.service.cohort_runs("run-1", "run-2")
+        self.assertEqual([], payload["alleles"])
+        self.assertEqual(
+            {"unique_alleles": 0, "core_alleles": 0, "variable_alleles": 0,
+             "private_alleles": {"run-1": 0, "run-2": 0}},
+            payload["counts"],
+        )
+        self.assertEqual({"1": 0, "2": 0}, payload["frequency_summary"])
+        self.assertEqual({}, payload["gene_summary"])
+        self.assertEqual({}, payload["impact_summary"])
+        self.assertEqual([0, 0], [run["allele_count"] for run in payload["runs"]])
+
+    def test_cohort_requires_two_distinct_existing_runs(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"impacts": ["HIGH"]}, key="r2", run_id="run-2")
+        with self.assertRaisesRegex(ValidationError, "cohort requires at least two distinct runs"):
+            self.service.cohort_runs("run-1", "")
+        for duplicated in ("run-1,run-1", "run-2,run-1,run-2"):
+            with self.subTest(duplicated=duplicated), self.assertRaisesRegex(
+                ConflictError, "cohort run ids must be distinct"
+            ):
+                self.service.cohort_runs("run-1", duplicated)
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.cohort_runs("missing", "run-1")
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.cohort_runs("run-1", "run-2,missing")
+        # Duplicate is reported before existence, existence before any data is read.
+        with self.assertRaisesRegex(ConflictError, "cohort run ids must be distinct"):
+            self.service.cohort_runs("run-1", "missing,run-1")
+
+    def test_cohort_does_not_modify_runs_or_provenance(self):
+        self._three_run_cohort_fixture()
+        before = {run_id: self.service._document(run_id) for run_id in ("run-1", "run-2", "run-3")}
+        self.service.cohort_runs("run-1", "run-2,run-3")
+        self.service.cohort_runs("run-3", "run-1,run-2")
+        for run_id in ("run-1", "run-2", "run-3"):
+            self.assertEqual(before[run_id], self.service._document(run_id))
+            self.assertTrue(self.service.run_provenance(run_id)["verified"])
+
     # --- exports -----------------------------------------------------------
 
     def test_jsonl_export_has_one_canonical_object_per_line_in_file_order(self):
@@ -819,6 +1011,116 @@ class CompareHttpTests(unittest.TestCase):
         status, _, body = self.get("/runs/run-1/compare")
         self.assertEqual(404, status)
         self.assertEqual("not_found", json.loads(body)["error"]["code"])
+
+
+class CohortHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1"}, "r1")
+        service.create_run("s1", {"id": "run-2", "params": {"impacts": ["HIGH"]}}, "r2")
+        service.create_run("s1", {"id": "run-3", "params": {"genes": ["EGFR"]}}, "r3")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_cohort_endpoint_returns_the_cohort(self):
+        status, content_type, body = self.get("/runs/run-1/cohort/run-2,run-3")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual(3, payload["run_count"])
+        self.assertEqual(["run-1", "run-2", "run-3"], [run["run_id"] for run in payload["runs"]])
+        self.assertEqual([8, 4, 2], [run["allele_count"] for run in payload["runs"]])
+        self.assertEqual(
+            {"unique_alleles": 8, "core_alleles": 2, "variable_alleles": 2,
+             "private_alleles": {"run-1": 4, "run-2": 0, "run-3": 0}},
+            payload["counts"],
+        )
+        self.assertEqual({"1": 4, "2": 2, "3": 2}, payload["frequency_summary"])
+        self.assertEqual(8, len(payload["alleles"]))
+        self.assertEqual(
+            ["run-1", "run-2", "run-3"],
+            next(
+                allele["present_in"]
+                for allele in payload["alleles"]
+                if (allele["chrom"], allele["pos"], allele["ref"], allele["alt"])
+                == ("chr7", 55019017, "G", "GA")
+            ),
+        )
+        # Repeated requests are byte-for-byte identical.
+        _, _, again = self.get("/runs/run-1/cohort/run-2,run-3")
+        self.assertEqual(body, again)
+        # Queue reorder only moves runs/present_in; the allele identity order is unchanged.
+        _, _, reordered_body = self.get("/runs/run-3/cohort/run-1,run-2")
+        reordered = json.loads(reordered_body)
+        self.assertEqual(
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in payload["alleles"]],
+            [(a["chrom"], a["pos"], a["ref"], a["alt"]) for a in reordered["alleles"]],
+        )
+        self.assertEqual(["run-3", "run-1", "run-2"], [run["run_id"] for run in reordered["runs"]])
+
+    def test_cohort_endpoint_errors_use_the_standard_error_object(self):
+        status, _, body = self.get("/runs/run-1/cohort/")
+        self.assertEqual(400, status)
+        self.assertEqual("cohort requires at least two distinct runs", json.loads(body)["error"]["message"])
+        status, _, body = self.get("/runs/run-1/cohort")
+        self.assertEqual(400, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertEqual("cohort requires at least two distinct runs", error["message"])
+        status, _, body = self.get("/runs/run-1/cohort/run-1")
+        self.assertEqual(409, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("conflict", error["code"])
+        self.assertEqual("cohort run ids must be distinct", error["message"])
+        status, _, body = self.get("/runs/run-1/cohort/run-2,run-2")
+        self.assertEqual(409, status)
+        self.assertEqual("cohort run ids must be distinct", json.loads(body)["error"]["message"])
+        status, _, body = self.get("/runs/run-1/cohort/missing")
+        self.assertEqual(404, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+        status, _, body = self.get("/runs/missing/cohort/run-1")
+        self.assertEqual(404, status)
+        self.assertEqual("run missing was not found", json.loads(body)["error"]["message"])
+        # Duplicate takes precedence over the missing id.
+        status, _, body = self.get("/runs/run-1/cohort/missing,run-1")
+        self.assertEqual(409, status)
+        self.assertEqual("cohort run ids must be distinct", json.loads(body)["error"]["message"])
+
+    def test_cohort_and_compare_endpoints_coexist(self):
+        status, _, body = self.get("/runs/run-1/compare/run-2")
+        self.assertEqual(200, status)
+        self.assertEqual({"left_only", "right_only", "shared"}, set(json.loads(body)) - {"counts", "left", "right", "gene_summary", "impact_summary"})
+        status, _, cohort_body = self.get("/runs/run-1/cohort/run-2")
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"run_count", "runs", "alleles", "counts", "frequency_summary", "gene_summary", "impact_summary"},
+            set(json.loads(cohort_body)),
+        )
 
 
 if __name__ == "__main__":

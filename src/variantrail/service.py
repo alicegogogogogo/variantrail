@@ -154,6 +154,84 @@ class VariantRail:
             "shared": shared,
         }
 
+    def cohort_runs(self, run_id: str, other_run_ids: str) -> dict[str, Any]:
+        """Compare the retained ALT alleles of two or more runs; read-only.
+
+        ``other_run_ids`` is comma-joined run ids; the full path order (run_id
+        first) is the cohort queue order.
+        """
+        run_ids = [run_id, *(part for part in other_run_ids.split(",") if part)]
+        if len(run_ids) < 2:
+            raise ValidationError("cohort requires at least two distinct runs")
+        if len(set(run_ids)) != len(run_ids):
+            raise ConflictError("cohort run ids must be distinct")
+        documents = [self._document(identifier) for identifier in run_ids]
+        per_run_alleles = [_alleles(document) for document in documents]
+
+        union: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+        for alleles in per_run_alleles:
+            for key, allele in alleles.items():
+                union.setdefault(key, allele)
+
+        runs = [
+            _side(identifier, document, alleles)
+            for identifier, document, alleles in zip(run_ids, documents, per_run_alleles)
+        ]
+        allele_entries: list[dict[str, Any]] = []
+        for key in sorted(union):
+            present_in = [
+                identifier
+                for identifier, alleles in zip(run_ids, per_run_alleles)
+                if key in alleles
+            ]
+            allele = dict(union[key])
+            allele["run_count"] = len(present_in)
+            allele["present_in"] = present_in
+            allele_entries.append(allele)
+
+        run_count = len(run_ids)
+        frequency = {str(number): 0 for number in range(1, run_count + 1)}
+        private = {identifier: 0 for identifier in run_ids}
+        gene_accumulator: dict[str, dict[str, int]] = {}
+        impact_accumulator: dict[str, dict[str, int]] = {}
+        core = variable = 0
+        for allele in allele_entries:
+            count = allele["run_count"]
+            frequency[str(count)] += 1
+            if count == run_count:
+                core += 1
+            elif count == 1:
+                private[allele["present_in"][0]] += 1
+            else:
+                variable += 1
+            for accumulator, value in (
+                (gene_accumulator, allele["gene"] or "NA"),
+                (impact_accumulator, allele["impact"]),
+            ):
+                entry = accumulator.setdefault(
+                    value, {"core_alleles": 0, "unique_alleles": 0, "variable_alleles": 0}
+                )
+                entry["unique_alleles"] += 1
+                if count == run_count:
+                    entry["core_alleles"] += 1
+                elif 1 < count < run_count:
+                    entry["variable_alleles"] += 1
+
+        return {
+            "alleles": allele_entries,
+            "counts": {
+                "unique_alleles": len(allele_entries),
+                "core_alleles": core,
+                "variable_alleles": variable,
+                "private_alleles": {identifier: private[identifier] for identifier in run_ids},
+            },
+            "frequency_summary": frequency,
+            "gene_summary": {key: gene_accumulator[key] for key in sorted(gene_accumulator)},
+            "impact_summary": {key: impact_accumulator[key] for key in sorted(impact_accumulator)},
+            "run_count": run_count,
+            "runs": runs,
+        }
+
     def run_provenance(self, run_id: str) -> dict[str, Any]:
         document = self._document(run_id)
         sample = self.get_sample(document["sample_id"])
