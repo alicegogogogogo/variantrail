@@ -1,8 +1,15 @@
+import json
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from variantrail.errors import ConflictError, NotFoundError, ValidationError
+from variantrail.export import TSV_HEADER
+from variantrail.server import Handler
 from variantrail.service import VariantRail
 
 HEADER = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
@@ -383,6 +390,142 @@ class VariantRailTests(unittest.TestCase):
             self.service.run_provenance("run-1")["steps"],
             self.service.run_provenance("run-2")["steps"],
         )
+
+    # --- exports -----------------------------------------------------------
+
+    def test_jsonl_export_has_one_canonical_object_per_line_in_file_order(self):
+        self.sample()
+        self.start_run()
+        variants = self.service.run_variants("run-1")["variants"]
+        content_type, body = self.service.run_export("run-1", "jsonl")
+        self.assertEqual("application/x-ndjson; charset=utf-8", content_type)
+        text = body.decode("utf-8")
+        lines = text.split("\n")
+        self.assertEqual("", lines[-1])  # exactly one trailing LF, no blank line
+        self.assertEqual(len(variants), len(lines) - 1)
+        self.assertNotIn("\r", text)
+        for line, variant in zip(lines[:-1], variants):
+            self.assertEqual(json.dumps(variant, ensure_ascii=False, separators=(",", ":"), sort_keys=True), line)
+            self.assertEqual(variant, json.loads(line))
+        self.assertEqual(variants[0], json.loads(lines[0]))
+
+    def test_tsv_export_has_fixed_header_and_one_row_per_annotation(self):
+        self.sample()
+        self.start_run()
+        content_type, body = self.service.run_export("run-1", "tsv")
+        self.assertEqual("text/tab-separated-values; charset=utf-8", content_type)
+        lines = body.decode("utf-8").split("\n")
+        self.assertEqual(TSV_HEADER, lines[0])
+        self.assertEqual("", lines[-1])
+        rows = [line.split("\t") for line in lines[1:-1]]
+        self.assertEqual(8, len(rows))  # seven records, one with two ALTs
+        self.assertEqual(
+            ["chr1", "11856378", "rs1", "G", "A", "1", "MTHFR", "missense_variant", "MODERATE", "60.0", "42", "PASS", "DP=42", "5"],
+            rows[0],
+        )
+        self.assertEqual(
+            ["chr7", "55019017", "NA", "G", "GA", "1", "EGFR", "frameshift_variant", "HIGH", "50.0", "31", "PASS", "DP=31", "8"],
+            rows[3],
+        )
+        # Multi-ALT record: rows stay in annotation order and share line number.
+        self.assertEqual(["chr12", "25245350", "NA", "C", "A", "1", "KRAS", "missense_variant", "MODERATE", "80.0", "60", "PASS", "DP=60", "10"], rows[5])
+        self.assertEqual(["chr12", "25245350", "NA", "C", "T", "2", "KRAS", "missense_variant", "MODERATE", "80.0", "60", "PASS", "DP=60", "10"], rows[6])
+        # Missing DP on the chr7 stop-gained record.
+        self.assertEqual("NA", rows[4][10])
+        self.assertEqual([5, 6, 7, 8, 9, 10, 10, 11], [int(row[13]) for row in rows])
+
+    def test_tsv_export_renders_nulls_empty_filter_and_sorted_flag_info(self):
+        vcf = single(pos=11856379, ref="A", alt="G", qual=".", filter_value="q10;S50", info="DP=7;ZZ=1;AA=2;FLAG")
+        self.sample(vcf=vcf)
+        self.start_run()
+        _, body = self.service.run_export("run-1", "tsv")
+        row = body.decode("utf-8").split("\n")[1].split("\t")
+        self.assertEqual(
+            ["chr1", "11856379", "NA", "A", "G", "1", "NA", "intergenic_variant", "MODIFIER", "NA", "7", "q10;S50", "AA=2;DP=7;FLAG;ZZ=1", "5"],
+            row,
+        )
+
+    def test_empty_run_exports_header_or_empty_body(self):
+        self.sample()
+        self.start_run({"genes": ["NO_SUCH_GENE"]})
+        _, jsonl_body = self.service.run_export("run-1", "jsonl")
+        _, tsv_body = self.service.run_export("run-1", "tsv")
+        self.assertEqual(b"", jsonl_body)
+        self.assertEqual((TSV_HEADER + "\n").encode("utf-8"), tsv_body)
+
+    def test_export_validates_format_and_run_existence(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(ValidationError, "format"):
+            self.service.run_export("run-1", "csv")
+        with self.assertRaises(NotFoundError):
+            self.service.run_export("missing", "tsv")
+        # An invalid format is a 400 even when the run is also missing.
+        with self.assertRaises(ValidationError):
+            self.service.run_export("missing", "csv")
+
+    def test_export_does_not_modify_the_run_or_provenance(self):
+        self.sample()
+        self.start_run()
+        before = self.service._document("run-1")
+        self.service.run_export("run-1", "tsv")
+        self.service.run_export("run-1", "jsonl")
+        after = self.service._document("run-1")
+        self.assertEqual(before, after)
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+
+
+class ExportHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1"}, "r1")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_export_endpoints_serve_rendered_bodies(self):
+        status, content_type, body = self.get("/runs/run-1/exports/jsonl")
+        self.assertEqual(200, status)
+        self.assertEqual("application/x-ndjson; charset=utf-8", content_type)
+        self.assertEqual(7, len(body.decode("utf-8").strip().split("\n")))
+        status, content_type, body = self.get("/runs/run-1/exports/tsv")
+        self.assertEqual(200, status)
+        self.assertEqual("text/tab-separated-values; charset=utf-8", content_type)
+        self.assertEqual(TSV_HEADER, body.decode("utf-8").split("\n")[0])
+
+    def test_export_errors_use_the_standard_error_object(self):
+        status, content_type, body = self.get("/runs/missing/exports/tsv")
+        self.assertEqual(404, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
+        status, _, body = self.get("/runs/run-1/exports/csv")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", json.loads(body)["error"]["code"])
+        status, _, body = self.get("/runs/run-1/exports")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
 
 
 if __name__ == "__main__":

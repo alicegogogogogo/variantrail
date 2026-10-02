@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
+from .export import render_jsonl, render_tsv
 from .model import identifier, run_view, sample_view
 from .pipeline import execute, normalize_params
 from .provenance import digest_text, verify_chain
@@ -104,6 +105,20 @@ class VariantRail:
     def run_variants(self, run_id: str) -> dict[str, Any]:
         variants = self._document(run_id)["variants"]
         return {"count": len(variants), "run_id": run_id, "variants": variants}
+
+    def run_export(self, run_id: str, format: str) -> tuple[str, bytes]:
+        """Render the retained variants of a saved run; the run is unchanged."""
+        if format == "jsonl":
+            content_type = "application/x-ndjson; charset=utf-8"
+            variants = self._document(run_id)["variants"]
+            body = render_jsonl(variants)
+        elif format == "tsv":
+            content_type = "text/tab-separated-values; charset=utf-8"
+            variants = self._document(run_id)["variants"]
+            body = render_tsv(variants)
+        else:
+            raise ValidationError("format must be one of jsonl, tsv")
+        return content_type, body
 
     def run_provenance(self, run_id: str) -> dict[str, Any]:
         document = self._document(run_id)

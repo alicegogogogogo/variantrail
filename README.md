@@ -34,7 +34,8 @@ has bound the port.
 
 ## HTTP API
 
-All bodies are JSON and unknown fields are rejected. Both `POST` endpoints
+All request and response bodies are JSON except the `jsonl` and `tsv` run
+export endpoints, and unknown fields are rejected. Both `POST` endpoints
 require an `Idempotency-Key` header; repeating a key returns the stored first
 response verbatim, and reusing a key for another operation is a `conflict`.
 
@@ -178,6 +179,42 @@ line, so every output stays traceable to the input:
 
 `line` is the 1-based line of the record in the uploaded VCF and `allele_index`
 is the 1-based VCF ALT index.
+
+### Export run results
+
+`GET /runs/run-1/exports/jsonl` and `GET /runs/run-1/exports/tsv` hand the
+retained variants of a saved run to downstream analysis as a stable payload.
+The body is generated on demand from the stored run; it is never written to
+disk, and the run, its variants and its provenance are not modified.
+
+`jsonl` is served as `application/x-ndjson; charset=utf-8`: one variant object
+per line in the original file order, using the same fields and values as
+`GET /runs/{run_id}/variants`. Each line is UTF-8 JSON with no indentation and
+keys sorted lexicographically, terminated by a single LF; the body ends with
+the last line's LF (no trailing blank line). A run with no variants returns an
+empty body.
+
+`tsv` is served as `text/tab-separated-values; charset=utf-8` and always opens
+with the fixed header:
+
+```
+chrom	pos	id	ref	alt	allele_index	gene	consequence	impact	qual	dp	filter	info	line
+```
+
+Each retained annotation is one row, so a record with several retained ALT
+alleles spans several rows; variant file order and annotation order are kept.
+Formatting rules:
+
+- `id`, `gene`, `qual` or `dp` is `NA` when null; `qual` otherwise keeps the
+  JSON decimal form (e.g. `60.0`);
+- an empty `FILTER` is `.`; several filters are joined with `;`;
+- `INFO` is `;`-joined `KEY=VALUE` pairs sorted by key; bare flags are written
+  as `KEY`; empty INFO is `.`;
+- numbers use the JSON decimal representation and text is not quoted.
+
+A run with no variants returns just the header line. An unknown `run_id`
+returns 404 `not_found`; any `format` other than `jsonl` or `tsv` returns 400
+`validation_error`, both with the standard error object.
 
 ### The annotation table
 
