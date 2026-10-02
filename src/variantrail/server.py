@@ -3,11 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from .errors import NotFoundError, ValidationError, VariantRailError
 from .service import VariantRail
+
+
+class RawResponse(NamedTuple):
+    """A pre-rendered response body with its own Content-Type (e.g. exports)."""
+
+    content_type: str
+    body: bytes
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -18,8 +25,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, value: Any) -> None:
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        self._respond(status, "application/json; charset=utf-8", body)
+
+    def _respond(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -48,6 +58,9 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_run(parts[1])
         if len(parts) == 3 and parts[0] == "runs" and parts[2] == "variants" and self.command == "GET":
             return 200, self.service.run_variants(parts[1])
+        if len(parts) == 4 and parts[0] == "runs" and parts[2] == "exports" and self.command == "GET":
+            content_type, body = self.service.run_export(parts[1], parts[3])
+            return 200, RawResponse(content_type, body.encode("utf-8"))
         if len(parts) == 3 and parts[0] == "runs" and parts[2] == "provenance" and self.command == "GET":
             return 200, self.service.run_provenance(parts[1])
         raise NotFoundError("route was not found")
@@ -55,7 +68,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self) -> None:
         try:
             status, response = self._dispatch()
-            self._json(status, response)
+            if isinstance(response, RawResponse):
+                self._respond(status, response.content_type, response.body)
+            else:
+                self._json(status, response)
         except VariantRailError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
         except Exception:

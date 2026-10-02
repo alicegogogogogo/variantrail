@@ -279,6 +279,88 @@ class VariantRailTests(unittest.TestCase):
         with self.assertRaisesRegex(ConflictError, "already exists"):
             self.start_run(params={"min_qual": 1}, key="k2")
 
+    # --- exports -----------------------------------------------------------
+
+    def test_jsonl_export_matches_run_variants_line_for_line(self):
+        import json
+
+        self.sample()
+        run = self.start_run()
+        content_type, body = self.service.run_export(run["id"], "jsonl")
+        self.assertEqual("application/x-ndjson; charset=utf-8", content_type)
+        variants = self.service.run_variants(run["id"])["variants"]
+        lines = body.split("\n")
+        self.assertEqual(len(variants) + 1, len(lines))
+        self.assertEqual("", lines[-1])
+        self.assertNotIn("\n\n", body)
+        self.assertNotIn("\r", body)
+        for line, variant in zip(lines, variants):
+            self.assertEqual(json.dumps(variant, ensure_ascii=False, sort_keys=True, separators=(",", ":")), line)
+            self.assertEqual(list(sorted(variant)), list(json.loads(line)))
+
+    def test_tsv_export_splits_alleles_and_formats_nulls(self):
+        self.sample()
+        run = self.start_run()
+        content_type, body = self.service.run_export(run["id"], "tsv")
+        self.assertEqual("text/tab-separated-values; charset=utf-8", content_type)
+        lines = body.split("\n")
+        self.assertEqual("", lines[-1])
+        self.assertEqual(
+            "chrom\tpos\tid\tref\talt\tallele_index\tgene\tconsequence\timpact\tqual\tdp\tfilter\tinfo\tline",
+            lines[0],
+        )
+        self.assertEqual(
+            [
+                "chr1\t11856378\trs1\tG\tA\t1\tMTHFR\tmissense_variant\tMODERATE\t60.0\t42\tPASS\tDP=42\t5",
+                "chr1\t11856378\trs2\tG\tT\t1\tMTHFR\tstop_gained\tHIGH\t20.0\t42\tPASS\tDP=42\t6",
+                "chr1\t11856379\tNA\tA\tG\t1\tNA\tintergenic_variant\tMODIFIER\tNA\t5\tq10\tDP=5\t7",
+                "chr7\t55019017\tNA\tG\tGA\t1\tEGFR\tframeshift_variant\tHIGH\t50.0\t31\tPASS\tDP=31\t8",
+                "chr7\t55019017\tNA\tG\tT\t1\tEGFR\tstop_gained\tHIGH\t50.0\tNA\tPASS\t.\t9",
+                "chr12\t25245350\tNA\tC\tA\t1\tKRAS\tmissense_variant\tMODERATE\t80.0\t60\tPASS\tDP=60\t10",
+                "chr12\t25245350\tNA\tC\tT\t2\tKRAS\tmissense_variant\tMODERATE\t80.0\t60\tPASS\tDP=60\t10",
+                "chr17\t43093445\tNA\tC\tT\t1\tBRCA1\tstop_gained\tHIGH\t99.0\t55\tPASS\tDP=55\t11",
+            ],
+            lines[1:-1],
+        )
+
+    def test_tsv_export_sorts_info_keys_and_keeps_flags_and_filters(self):
+        vcf = "\n".join(
+            [
+                PREAMBLE,
+                HEADER,
+                "chr1\t11856378\trs1\tG\tA\t60\tq10;lowDP\tDP=42;FLAG;AB=0.5",
+            ]
+        ) + "\n"
+        self.sample(vcf=vcf)
+        run = self.start_run()
+        _, body = self.service.run_export(run["id"], "tsv")
+        row = body.split("\n")[1]
+        self.assertEqual(
+            "chr1\t11856378\trs1\tG\tA\t1\tMTHFR\tmissense_variant\tMODERATE\t60.0\t42\tq10;lowDP\tAB=0.5;DP=42;FLAG\t5",
+            row,
+        )
+
+    def test_empty_run_exports_header_or_empty_body(self):
+        self.sample()
+        run = self.start_run({"genes": ["NOSUCH"]})
+        _, jsonl = self.service.run_export(run["id"], "jsonl")
+        _, tsv = self.service.run_export(run["id"], "tsv")
+        self.assertEqual("", jsonl)
+        self.assertEqual(
+            "chrom\tpos\tid\tref\talt\tallele_index\tgene\tconsequence\timpact\tqual\tdp\tfilter\tinfo\tline\n",
+            tsv,
+        )
+
+    def test_export_errors_and_read_only_behaviour(self):
+        self.sample()
+        run = self.start_run()
+        with self.assertRaises(ValidationError):
+            self.service.run_export(run["id"], "csv")
+        with self.assertRaises(NotFoundError):
+            self.service.run_export("missing", "jsonl")
+        self.service.run_export(run["id"], "tsv")
+        self.assertTrue(self.service.run_provenance(run["id"])["verified"])
+
     # --- idempotency -------------------------------------------------------
 
     def test_idempotency_key_is_required(self):

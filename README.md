@@ -179,6 +179,32 @@ line, so every output stays traceable to the input:
 `line` is the 1-based line of the record in the uploaded VCF and `allele_index`
 is the 1-based VCF ALT index.
 
+### Export run variants
+
+`GET /runs/run-1/exports/jsonl` and `GET /runs/run-1/exports/tsv` render the
+kept variants of a stored run for downstream analysis. The export is generated
+on the fly from the saved run; nothing is written back and no hash changes.
+Any other `format` is a `validation_error`.
+
+`jsonl` (`application/x-ndjson; charset=utf-8`) writes one variant object per
+line, in file order, exactly as `GET /runs/run-1/variants` returns them: compact
+JSON with keys sorted, UTF-8, one `\n` per line and no trailing blank line. An
+empty run exports an empty body.
+
+`tsv` (`text/tab-separated-values; charset=utf-8`) writes the fixed header
+
+```
+chrom	pos	id	ref	alt	allele_index	gene	consequence	impact	qual	dp	filter	info	line
+```
+
+followed by one row per kept annotation, so a multi-ALT record contributes one
+row per `allele_index`, in variant file order then annotation order. `id`,
+`gene`, `qual` and `dp` are `NA` when null; an empty `filter` is `.` and
+several tokens are joined with `;`. `info` is a `;`-joined `KEY=VALUE` string
+with keys sorted (a pure flag is written as bare `KEY`), or `.` when empty.
+Numbers keep their JSON decimal representation and text is unquoted. An empty
+run exports just the header line.
+
 ### The annotation table
 
 Annotation matches the exact tuple `(CHROM, POS, REF, ALT)`. A variant with no
