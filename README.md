@@ -35,9 +35,10 @@ has bound the port.
 ## HTTP API
 
 All request and response bodies are JSON except the `jsonl`, `tsv` and `vcf`
-run export endpoints, and unknown fields are rejected. Both `POST` endpoints
-require an `Idempotency-Key` header; repeating a key returns the stored first
-response verbatim, and reusing a key for another operation is a `conflict`.
+run export endpoints, and unknown fields are rejected. All three `POST`
+endpoints require an `Idempotency-Key` header; repeating a key returns the
+stored first response verbatim, and reusing a key for another operation is a
+`conflict`.
 
 ### Health
 
@@ -495,6 +496,66 @@ re-reads the stored sample VCF, re-executes all four steps with the stored
 `params`, and compares the four `output_sha256` values, the statistics and the
 variants. `verified` is the conjunction of both; the endpoint never rewrites the
 stored trail.
+
+### Get a run snapshot
+
+`GET /runs/run-1/snapshot` is a read-only immutable recipe for a finished run:
+it only projects the stored run and its provenance, so no pipeline step is
+re-executed and no run, sample or provenance record is rewritten. Returns HTTP
+200:
+
+```json
+{"run_id":"run-1","sample_id":"trio-1",
+ "sample_sha256":"45520c9b2b4798adafe3bdbaf137c567536527581c259dc2d92c391baf2a94ef",
+ "params":{"genes":["BRCA1","EGFR","MTHFR"],"impacts":[],"min_dp":10,"min_qual":30.0,"pass_only":true},
+ "parser_version":"variantrail-vcf-1",
+ "annotation_table_sha256":"...",
+ "provenance_head":"40807a2cebf5110a5a3be231ab78ca690823b9def8414dd373314354cac65b40",
+ "step_output_sha256":["<ingest>","<filter>","<annotate>","<summarize>"]}
+```
+
+- `params` are the saved parameters of the run, exactly as stored.
+- `parser_version` and `annotation_table_sha256` are taken from the run's own
+  provenance (the ingest and annotate step params).
+- `step_output_sha256` lists the four step output digests in
+  `ingest`, `filter`, `annotate`, `summarize` order.
+- Repeated requests return byte-identical JSON. An unknown `run_id` returns 404
+  `not_found` with the message `run <run_id> was not found`.
+
+### Replay a run
+
+```http
+POST /runs/run-1/replays
+Idempotency-Key: replay-1
+Content-Type: application/json
+
+{"id":"run-1-copy"}
+```
+
+The body must contain exactly `id`; `id` follows the existing identifier rules
+and alternative parameters are not accepted. The endpoint uses the original VCF
+associated with the source run and the source run's saved parameters to execute
+the existing four-step pipeline. It first verifies the source hash chain, then
+compares the fresh run's four step output digests, `statistics` and `variants`
+with the source run. Only when everything agrees is the new run saved,
+atomically, and the response is the same 201 run view as
+`POST /samples/{sample_id}/runs`. The new run inherits the source `sample_id`,
+`sample_sha256` and parameters, and every other public endpoint works on it with
+its existing semantics. The source run and its sample are never modified.
+
+Error cases:
+
+- source run missing — 404 `not_found`, `run <run_id> was not found`;
+- body not exactly `{"id":...}` — 400 `validation_error`,
+  `replay must contain exactly id`;
+- new `id` already used — 409 `conflict`, `run <id> already exists`;
+- source hash chain invalid, or any step digest, statistic or variant differs —
+  409 `conflict`, `run <run_id> is not reproducible`; neither the new run nor an
+  idempotency response is saved.
+
+The `Idempotency-Key` header follows the existing contract: missing keys are a
+400 `validation_error`, a key reused for another operation is a `conflict`, and
+repeating a successful request returns the first response verbatim.
 
 ## Step-level lineage manifest
 

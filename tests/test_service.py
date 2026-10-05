@@ -532,6 +532,242 @@ class VariantRailTests(unittest.TestCase):
             self.service.run_provenance("run-2")["steps"],
         )
 
+    # --- run snapshots -----------------------------------------------------
+
+    def test_snapshot_projects_the_immutable_recipe(self):
+        from variantrail.annotate import table_sha256
+
+        self.sample()
+        run = self.start_run({"pass_only": True, "min_qual": 30, "min_dp": 10, "genes": ["EGFR", "MTHFR"]})
+        snapshot = self.service.run_snapshot("run-1")
+        self.assertEqual(
+            {
+                "run_id", "sample_id", "sample_sha256", "params",
+                "parser_version", "annotation_table_sha256",
+                "provenance_head", "step_output_sha256",
+            },
+            set(snapshot),
+        )
+        self.assertEqual("run-1", snapshot["run_id"])
+        self.assertEqual("s1", snapshot["sample_id"])
+        self.assertEqual(run["sample_sha256"], snapshot["sample_sha256"])
+        self.assertEqual(run["params"], snapshot["params"])
+        self.assertEqual("variantrail-vcf-1", snapshot["parser_version"])
+        self.assertEqual(table_sha256(), snapshot["annotation_table_sha256"])
+        self.assertEqual(run["provenance_head"], snapshot["provenance_head"])
+        steps = self.service.run_provenance("run-1")["steps"]
+        self.assertEqual(4, len(snapshot["step_output_sha256"]))
+        self.assertEqual(
+            [entry["output_sha256"] for entry in steps],
+            snapshot["step_output_sha256"],
+        )
+
+    def test_snapshot_reads_saved_params_including_record_filter(self):
+        self.sample()
+        expression = {"field": "chrom", "op": "eq", "value": "chr1"}
+        run = self.start_run({"record_filter": expression})
+        snapshot = self.service.run_snapshot("run-1")
+        self.assertEqual(run["params"], snapshot["params"])
+        self.assertEqual(expression, snapshot["params"]["record_filter"])
+
+    def test_snapshot_is_read_only_and_byte_stable(self):
+        self.sample()
+        self.start_run()
+        before = self.service._document("run-1")
+        first = self.service.run_snapshot("run-1")
+        second = self.service.run_snapshot("run-1")
+        self.assertEqual(first, second)
+        canonical = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        self.assertEqual(canonical(first).encode(), canonical(second).encode())
+        self.assertEqual(before, self.service._document("run-1"))
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+
+    def test_snapshot_unknown_run_is_not_found(self):
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.run_snapshot("missing")
+
+    # --- replays -----------------------------------------------------------
+
+    def test_replay_creates_a_run_matching_the_source(self):
+        self.sample()
+        source = self.start_run({"pass_only": True, "min_qual": 30, "min_dp": 10, "genes": ["MTHFR", "EGFR"]})
+        replay = self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        self.assertEqual("succeeded", replay["status"])
+        self.assertEqual("run-2", replay["id"])
+        self.assertEqual(source["sample_id"], replay["sample_id"])
+        self.assertEqual(source["sample_sha256"], replay["sample_sha256"])
+        self.assertEqual(source["params"], replay["params"])
+        self.assertEqual(source["statistics"], replay["statistics"])
+        self.assertEqual(source["provenance_head"], replay["provenance_head"])
+        self.assertEqual(source["provenance_length"], replay["provenance_length"])
+        # The new run is a fully supported run: reads, variants, provenance all work.
+        self.assertEqual(replay, self.service.get_run("run-2"))
+        self.assertEqual(
+            self.service.run_variants("run-1")["variants"],
+            self.service.run_variants("run-2")["variants"],
+        )
+        self.assertTrue(self.service.run_provenance("run-2")["verified"])
+
+    def test_replay_reproduces_runs_with_record_filters(self):
+        self.sample()
+        source = self.start_run({"record_filter": {"all": [
+            {"field": "pos", "op": "gte", "value": 55019017},
+            {"field": "qual", "op": "gte", "value": 50},
+        ]}})
+        replay = self.service.replay_run("run-1", {"id": "run-1-copy"}, "rp1")
+        self.assertEqual(source["params"], replay["params"])
+        self.assertEqual(source["statistics"], replay["statistics"])
+        self.assertEqual(source["provenance_head"], replay["provenance_head"])
+
+    def test_replay_does_not_modify_the_source_or_sample(self):
+        self.sample()
+        self.start_run({"min_qual": 30})
+        run_before = self.service._document("run-1")
+        sample_before = self.service.get_sample("s1")
+        self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        self.assertEqual(run_before, self.service._document("run-1"))
+        self.assertEqual(sample_before, self.service.get_sample("s1"))
+
+    def test_replay_body_must_contain_exactly_id(self):
+        self.sample()
+        self.start_run()
+        for body in (
+            {},
+            {"id": "run-2", "params": {"min_qual": 1}},
+            {"params": {}},
+            {"id": "run-2", "extra": 1},
+            ["run-2"],
+            "run-2",
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(
+                ValidationError, "replay must contain exactly id"
+            ):
+                self.service.replay_run("run-1", body, f"k-{type(body).__name__}")
+        # The failed validations saved neither a run nor an idempotency response.
+        with self.assertRaises(NotFoundError):
+            self.service.get_run("run-2")
+
+    def test_replay_id_follows_the_identifier_rules(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(ValidationError, "run id"):
+            self.service.replay_run("run-1", {"id": "bad id"}, "rp1")
+
+    def test_replay_unknown_source_is_not_found(self):
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.replay_run("missing", {"id": "run-2"}, "rp1")
+
+    def test_replay_duplicate_new_id_conflicts(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(params={"min_qual": 1}, key="r2", run_id="run-2")
+        with self.assertRaisesRegex(ConflictError, r"run run-2 already exists"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        # Replaying onto the source run's own id is also a duplicate conflict.
+        with self.assertRaisesRegex(ConflictError, r"run run-1 already exists"):
+            self.service.replay_run("run-1", {"id": "run-1"}, "rp2")
+
+    def test_replay_requires_idempotency_key(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.replay_run("run-1", {"id": "run-2"}, None)
+
+    def test_replay_repeated_key_returns_the_first_response(self):
+        self.sample()
+        self.start_run()
+        first = self.service.replay_run("run-1", {"id": "run-2"}, "shared")
+        # A retry resends the same request (same new id) and gets the stored answer.
+        second = self.service.replay_run("run-1", {"id": "run-2"}, "shared")
+        self.assertEqual(first, second)
+        self.assertEqual("run-2", second["id"])
+        # Reusing the key for a replay that creates a different run is another operation.
+        with self.assertRaises(ConflictError):
+            self.service.replay_run("run-1", {"id": "run-3"}, "shared")
+        with self.assertRaises(NotFoundError):
+            self.service.get_run("run-3")
+
+    def test_replay_key_cannot_be_reused_for_another_operation(self):
+        self.sample()
+        self.start_run()
+        self.service.replay_run("run-1", {"id": "run-2"}, "shared")
+        with self.assertRaises(ConflictError):
+            self.start_run(key="shared", run_id="run-3")
+        with self.assertRaises(ConflictError):
+            self.service.replay_run("run-1", {"id": "run-4"}, "shared")
+
+    def _tamper_run(self, run_id, mutate):
+        document = self.service._document(run_id)
+        mutate(document)
+        self.service.store.connection.execute(
+            "UPDATE runs SET document = ? WHERE id = ?", (self.service.store.encode(document), run_id)
+        )
+
+    def test_replay_rejects_a_broken_source_chain_without_saving(self):
+        from variantrail.pipeline import execute
+
+        self.sample()
+        self.start_run()
+        self._tamper_run("run-1", lambda doc: doc["provenance"][1]["params"].__setitem__("min_qual", 999.0))
+        with self.assertRaisesRegex(ConflictError, "run run-1 is not reproducible"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        with self.assertRaises(NotFoundError):
+            self.service.get_run("run-2")
+        # No idempotency response persisted: after the chain is genuinely
+        # repaired, the same key drives a successful replay.
+        sample = self.service.get_sample("s1")
+        fresh = execute({"records": sample["records"]}, sample["vcf"], self.service._document("run-1")["params"])
+        self._tamper_run(
+            "run-1",
+            lambda doc: doc.update(provenance=fresh["provenance"]),
+        )
+        replay = self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        self.assertEqual("run-2", replay["id"])
+
+    def test_replay_rejects_tampered_statistics_without_saving(self):
+        self.sample()
+        self.start_run()
+        self._tamper_run("run-1", lambda doc: doc["statistics"].__setitem__("records_kept", 999))
+        with self.assertRaisesRegex(ConflictError, "run run-1 is not reproducible"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        with self.assertRaises(NotFoundError):
+            self.service.get_run("run-2")
+        # The source is untouched by the failed replay and the key stays usable.
+        self.assertEqual(999, self.service._document("run-1")["statistics"]["records_kept"])
+        self._tamper_run("run-1", lambda doc: doc["statistics"].__setitem__("records_kept", 7))
+        replay = self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        self.assertEqual("run-2", replay["id"])
+
+    def test_replay_rejects_tampered_variants_without_saving(self):
+        self.sample()
+        self.start_run()
+        self._tamper_run("run-1", lambda doc: doc["variants"].pop())
+        with self.assertRaisesRegex(ConflictError, "run run-1 is not reproducible"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        with self.assertRaises(NotFoundError):
+            self.service.get_run("run-2")
+
+    def test_replay_new_run_supports_all_read_endpoints(self):
+        self.sample()
+        self.start_run({"genes": ["MTHFR", "EGFR", "BRCA1"], "min_qual": 30})
+        self.service.replay_run("run-1", {"id": "run-2"}, "rp1")
+        qc_source = self.service.run_qc("run-1")
+        qc_replay = self.service.run_qc("run-2")
+        self.assertEqual("run-2", qc_replay.pop("run_id"))
+        qc_source.pop("run_id")
+        self.assertEqual(qc_source, qc_replay)
+        self.assertEqual(
+            self.service.run_export("run-1", "jsonl")[1],
+            self.service.run_export("run-2", "jsonl")[1],
+        )
+        self.assertEqual(
+            self.service.run_export("run-1", "vcf")[1],
+            self.service.run_export("run-2", "vcf")[1],
+        )
+        comparison = self.service.compare_runs("run-1", "run-2")
+        self.assertEqual(comparison["counts"]["shared"], comparison["counts"]["union"])
+        self.assertEqual(0, comparison["counts"]["left_only"])
+
     # --- quality control ---------------------------------------------------
 
     def test_qc_summarizes_retained_records_and_alleles(self):
@@ -1522,6 +1758,150 @@ class CohortHttpTests(unittest.TestCase):
             {"run_count", "runs", "alleles", "counts", "frequency_summary", "gene_summary", "impact_summary"},
             set(json.loads(cohort_body)),
         )
+
+
+class SnapshotReplayHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1", "params": {"min_qual": 30, "min_dp": 10}}, "r1")
+        Handler.service = service
+        self.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def request(self, method, path, body=None, idempotency_key=None):
+        data = None
+        headers = {}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=data, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            payload = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, payload
+
+    def test_snapshot_endpoint_returns_the_recipe(self):
+        status, content_type, body = self.request("GET", "/runs/run-1/snapshot")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual(
+            {
+                "run_id", "sample_id", "sample_sha256", "params",
+                "parser_version", "annotation_table_sha256",
+                "provenance_head", "step_output_sha256",
+            },
+            set(payload),
+        )
+        self.assertEqual("run-1", payload["run_id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual(self.service.get_run("run-1")["provenance_head"], payload["provenance_head"])
+        self.assertEqual(4, len(payload["step_output_sha256"]))
+        # Byte-identical on repeat.
+        _, _, again = self.request("GET", "/runs/run-1/snapshot")
+        self.assertEqual(body, again)
+
+    def test_snapshot_endpoint_unknown_run_is_404(self):
+        status, content_type, body = self.request("GET", "/runs/missing/snapshot")
+        self.assertEqual(404, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+
+    def test_replay_endpoint_creates_a_run(self):
+        status, content_type, body = self.request("POST", "/runs/run-1/replays", {"id": "run-2"}, "rp1")
+        self.assertEqual(201, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        source = self.service.get_run("run-1")
+        self.assertEqual("run-2", payload["id"])
+        self.assertEqual("succeeded", payload["status"])
+        self.assertEqual(source["sample_id"], payload["sample_id"])
+        self.assertEqual(source["sample_sha256"], payload["sample_sha256"])
+        self.assertEqual(source["params"], payload["params"])
+        self.assertEqual(source["statistics"], payload["statistics"])
+        self.assertEqual(source["provenance_head"], payload["provenance_head"])
+        self.assertEqual(source["provenance_length"], payload["provenance_length"])
+        for field in ("sample_id", "sample_sha256", "params", "statistics", "status"):
+            self.assertEqual(source[field], payload[field], field)
+        # The replayed run is readable through the standard endpoint.
+        status, _, fetched = self.request("GET", "/runs/run-2")
+        self.assertEqual(200, status)
+        self.assertEqual(payload, json.loads(fetched))
+
+    def test_replay_endpoint_is_idempotent_on_retry(self):
+        status, _, first = self.request("POST", "/runs/run-1/replays", {"id": "run-2"}, "shared")
+        self.assertEqual(201, status)
+        # Same request, same key: stored first response comes back verbatim.
+        status, _, second = self.request("POST", "/runs/run-1/replays", {"id": "run-2"}, "shared")
+        self.assertEqual(201, status)
+        self.assertEqual(first, second)
+        # Same key for a different new run is another operation.
+        status, _, body = self.request("POST", "/runs/run-1/replays", {"id": "run-3"}, "shared")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(body)["error"]["code"])
+
+    def test_replay_endpoint_validation_errors(self):
+        status, _, body = self.request("POST", "/runs/run-1/replays", {"id": "run-2", "params": {}}, "rp1")
+        self.assertEqual(400, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertEqual("replay must contain exactly id", error["message"])
+        status, _, body = self.request("POST", "/runs/run-1/replays", {"id": "bad id"}, "rp2")
+        self.assertEqual(400, status)
+        self.assertIn("run id", json.loads(body)["error"]["message"])
+        status, _, body = self.request("POST", "/runs/run-1/replays", {"id": "run-2"})
+        self.assertEqual(400, status)
+        self.assertEqual("Idempotency-Key header is required", json.loads(body)["error"]["message"])
+
+    def test_replay_endpoint_conflicts(self):
+        # Duplicate new id.
+        self.service.create_run("s1", {"id": "run-2"}, "r2")
+        status, _, body = self.request("POST", "/runs/run-1/replays", {"id": "run-2"}, "rp1")
+        self.assertEqual(409, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("conflict", error["code"])
+        self.assertEqual("run run-2 already exists", error["message"])
+        # Idempotency key reused for another operation.
+        status, _, body = self.request("POST", "/runs/run-1/replays", {"id": "run-3"}, "r1")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", json.loads(body)["error"]["code"])
+
+    def test_replay_endpoint_missing_source_is_404(self):
+        status, _, body = self.request("POST", "/runs/missing/replays", {"id": "run-2"}, "rp1")
+        self.assertEqual(404, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+
+    def test_replay_endpoint_rejects_untampered_route_shapes(self):
+        status, _, body = self.request("GET", "/runs/run-1/replays")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
+        status, _, body = self.request("POST", "/runs/run-1/snapshot", {"id": "run-2"}, "rp1")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
 
 
 if __name__ == "__main__":

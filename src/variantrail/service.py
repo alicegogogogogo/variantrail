@@ -102,6 +102,75 @@ class VariantRail:
     def get_run(self, run_id: str) -> dict[str, Any]:
         return run_view(self._document(run_id))
 
+    def run_snapshot(self, run_id: str) -> dict[str, Any]:
+        """Read-only immutable recipe for a saved run.
+
+        Projects the stored run document and its provenance: no pipeline step
+        re-runs and the run, sample and provenance are never rewritten.
+        """
+        document = self._document(run_id)
+        provenance = document["provenance"]
+        return {
+            "run_id": run_id,
+            "sample_id": document["sample_id"],
+            "sample_sha256": document["sample_sha256"],
+            "params": document["params"],
+            "parser_version": provenance[0]["params"]["parser_version"],
+            "annotation_table_sha256": provenance[2]["params"]["annotation_table_sha256"],
+            "provenance_head": provenance[-1]["hash"],
+            "step_output_sha256": [entry["output_sha256"] for entry in provenance],
+        }
+
+    def replay_run(self, run_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Reproduce a finished run as a new, immutable run; read-only on source.
+
+        The source VCF and the saved parameters are the only recipe accepted;
+        the body must hold exactly ``id``. The source hash chain is verified
+        first, then the four step output digests, statistics and variants of a
+        fresh pipeline execution are compared with the source run. Only when
+        everything agrees is the new run saved, atomically, and returned with
+        the standard run view.
+        """
+        if not isinstance(raw, dict) or set(raw) != {"id"}:
+            raise ValidationError("replay must contain exactly id")
+        new_run_id = identifier(raw["id"], "run id")
+
+        def replay() -> dict[str, Any]:
+            document = self._document(run_id)
+            if not verify_chain(document["provenance"]):
+                raise ConflictError(f"run {run_id} is not reproducible")
+            sample = self.get_sample(document["sample_id"])
+            reproduced = execute({"records": sample["records"]}, sample["vcf"], document["params"])
+            reproducible = (
+                [entry["output_sha256"] for entry in reproduced["provenance"]]
+                == [entry["output_sha256"] for entry in document["provenance"]]
+                and reproduced["statistics"] == document["statistics"]
+                and reproduced["variants"] == document["variants"]
+            )
+            if not reproducible:
+                raise ConflictError(f"run {run_id} is not reproducible")
+            new_document = {
+                "id": new_run_id,
+                "params": document["params"],
+                "provenance": reproduced["provenance"],
+                "sample_id": document["sample_id"],
+                "sample_sha256": document["sample_sha256"],
+                "statistics": reproduced["statistics"],
+                "variants": reproduced["variants"],
+            }
+            try:
+                self.store.connection.execute(
+                    "INSERT INTO runs(id, sample_id, document) VALUES (?, ?, ?)",
+                    (new_run_id, document["sample_id"], self.store.encode(new_document)),
+                )
+            except Exception as error:
+                if "UNIQUE constraint" in str(error):
+                    raise ConflictError(f"run {new_run_id} already exists") from error
+                raise
+            return run_view(new_document)
+
+        return self._idempotent(key, f"replay-run:{new_run_id}", replay)
+
     def run_variants(self, run_id: str) -> dict[str, Any]:
         variants = self._document(run_id)["variants"]
         return {"count": len(variants), "run_id": run_id, "variants": variants}
