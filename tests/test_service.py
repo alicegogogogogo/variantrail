@@ -887,6 +887,309 @@ class VariantRailTests(unittest.TestCase):
             self.service.run_export("missing", "vcf")
 
 
+class RecordFilterTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = VariantRail(str(Path(self.directory.name) / "test.db"))
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def sample(self, key="s1", vcf=VCF, sample_id="s1"):
+        return self.service.create_sample({"id": sample_id, "vcf": vcf}, key)
+
+    def start_run(self, params=None, key="r1", run_id="run-1", sample_id="s1"):
+        body = {"id": run_id}
+        if params is not None:
+            body["params"] = params
+        return self.service.create_run(sample_id, body, key)
+
+    def kept_lines(self, run_id="run-1"):
+        return [variant["line"] for variant in self.service.run_variants(run_id)["variants"]]
+
+    def test_eq_on_a_scalar_field(self):
+        self.sample()
+        run = self.start_run({"record_filter": {"field": "chrom", "op": "eq", "value": "chr7"}})
+        self.assertEqual([8, 9], self.kept_lines())
+        self.assertEqual(
+            {"allele_filtered": 0, "dp_below_min": 0, "not_pass": 0, "qual_below_min": 0, "rule_mismatch": 5},
+            run["statistics"]["filter_counts"],
+        )
+        self.assertEqual(5, run["statistics"]["records_filtered"])
+        self.assertEqual(2, run["statistics"]["records_kept"])
+
+    def test_in_and_any_element_semantics_for_alt_and_filter(self):
+        self.sample()
+        run = self.start_run({"record_filter": {"field": "alt", "op": "in", "value": ["GA", "T"]}})
+        self.assertEqual([6, 8, 9, 10, 11], self.kept_lines())
+        self.assertEqual(2, run["statistics"]["filter_counts"]["rule_mismatch"])
+        run = self.start_run(
+            {"record_filter": {"field": "filter", "op": "eq", "value": "q10"}}, key="r2", run_id="run-2"
+        )
+        self.assertEqual([7], self.kept_lines("run-2"))
+        run = self.start_run(
+            {"record_filter": {"field": "filter", "op": "eq", "value": "PASS"}}, key="r3", run_id="run-3"
+        )
+        self.assertEqual([5, 6, 8, 9, 10, 11], self.kept_lines("run-3"))
+
+    def test_exists_and_null_semantics(self):
+        self.sample()
+        run = self.start_run({"record_filter": {"field": "qual", "op": "exists"}})
+        self.assertEqual([5, 6, 8, 9, 10, 11], self.kept_lines())
+        run = self.start_run({"record_filter": {"field": "id", "op": "exists"}}, key="r2", run_id="run-2")
+        self.assertEqual([5, 6], self.kept_lines("run-2"))
+        # A null qual fails eq and comparisons but can be inverted with not.
+        run = self.start_run(
+            {"record_filter": {"not": {"field": "qual", "op": "exists"}}}, key="r3", run_id="run-3"
+        )
+        self.assertEqual([7], self.kept_lines("run-3"))
+
+    def test_comparisons_on_pos_qual_dp_and_info(self):
+        self.sample()
+        run = self.start_run({"record_filter": {"field": "pos", "op": "gte", "value": 55019017}})
+        self.assertEqual([8, 9], self.kept_lines())
+        run = self.start_run({"record_filter": {"field": "qual", "op": "lt", "value": 60}}, key="r2", run_id="run-2")
+        self.assertEqual([6, 8, 9], self.kept_lines("run-2"))
+        run = self.start_run({"record_filter": {"field": "dp", "op": "gt", "value": 42}}, key="r3", run_id="run-3")
+        self.assertEqual([10, 11], self.kept_lines("run-3"))
+        # INFO/DP is a string in storage; numeric ops parse it, missing DP is false.
+        run = self.start_run(
+            {"record_filter": {"field": "info.DP", "op": "lte", "value": 42}}, key="r4", run_id="run-4"
+        )
+        self.assertEqual([5, 6, 7, 8], self.kept_lines("run-4"))
+
+    def test_info_flags_eq_and_unparseable_numbers(self):
+        vcf = "\n".join(
+            [
+                PREAMBLE,
+                HEADER,
+                "chr1\t100\t.\tA\tG\t10\tPASS\tDP=30;AF=0.25;FLAG",
+                "chr1\t200\t.\tA\tG\t20\tPASS\tDP=5;AF=high",
+                "chr1\t300\t.\tA\tG\t.\tq10\t.",
+            ]
+        ) + "\n"
+        self.sample(vcf=vcf)
+        # A bare INFO flag counts as existing.
+        run = self.start_run({"record_filter": {"field": "info.FLAG", "op": "exists"}})
+        self.assertEqual([5], self.kept_lines())
+        # ...but its null value fails eq like any other missing value.
+        run = self.start_run(
+            {"record_filter": {"field": "info.FLAG", "op": "eq", "value": "FLAG"}}, key="r2", run_id="run-2"
+        )
+        self.assertEqual([], self.kept_lines("run-2"))
+        # eq compares the stored INFO string verbatim.
+        run = self.start_run(
+            {"record_filter": {"field": "info.AF", "op": "eq", "value": "0.25"}}, key="r3", run_id="run-3"
+        )
+        self.assertEqual([5], self.kept_lines("run-3"))
+        # "high" does not parse as a finite decimal, so only line 5 compares.
+        run = self.start_run(
+            {"record_filter": {"field": "info.AF", "op": "gt", "value": 0.1}}, key="r4", run_id="run-4"
+        )
+        self.assertEqual([5], self.kept_lines("run-4"))
+
+    def test_all_any_not_combination(self):
+        self.sample()
+        rule = {
+            "all": [
+                {"field": "qual", "op": "gte", "value": 50},
+                {"any": [
+                    {"field": "chrom", "op": "eq", "value": "chr7"},
+                    {"field": "chrom", "op": "eq", "value": "chr17"},
+                ]},
+                {"not": {"field": "dp", "op": "lt", "value": 40}},
+            ]
+        }
+        run = self.start_run({"record_filter": rule})
+        # Line 8 fails the negated dp<40 clause; line 9 has no DP, so the
+        # comparison is false and the negation keeps it.
+        self.assertEqual([9, 11], self.kept_lines())
+        self.assertEqual(5, run["statistics"]["filter_counts"]["rule_mismatch"])
+
+    def test_rule_mismatch_precedence_and_zero_filled_key(self):
+        self.sample()
+        # pass_only and min_dp win over the rule; the rule beats allele filtering.
+        run = self.start_run(
+            {
+                "pass_only": True,
+                "min_dp": 10,
+                "record_filter": {"field": "chrom", "op": "eq", "value": "chr1"},
+            }
+        )
+        self.assertEqual([5, 6], self.kept_lines())
+        self.assertEqual(
+            {"allele_filtered": 0, "dp_below_min": 1, "not_pass": 1, "qual_below_min": 0, "rule_mismatch": 3},
+            run["statistics"]["filter_counts"],
+        )
+        # A rule that matches everything still reports the key, as zero.
+        run = self.start_run(
+            {"record_filter": {"field": "chrom", "op": "in", "value": ["chr1", "chr7", "chr12", "chr17"]}},
+            key="r2",
+            run_id="run-2",
+        )
+        self.assertEqual(0, run["statistics"]["filter_counts"]["rule_mismatch"])
+        self.assertEqual(7, run["statistics"]["records_kept"])
+
+    def test_expression_is_stored_on_the_run_and_the_filter_step(self):
+        self.sample()
+        rule = {"all": [{"field": "dp", "op": "gte", "value": 10}, {"field": "filter", "op": "eq", "value": "PASS"}]}
+        run = self.start_run({"record_filter": rule})
+        self.assertEqual(rule, run["params"]["record_filter"])
+        self.assertEqual(
+            {"genes", "impacts", "min_dp", "min_qual", "pass_only", "record_filter"}, set(run["params"])
+        )
+        steps = self.service.run_provenance("run-1")["steps"]
+        self.assertEqual(rule, steps[1]["params"]["record_filter"])
+        self.assertEqual(
+            {"min_dp", "min_qual", "pass_only", "record_filter"}, set(steps[1]["params"])
+        )
+
+    def test_default_run_has_no_rule_key_and_unchanged_hashes(self):
+        self.sample()
+        run = self.start_run()
+        self.assertNotIn("record_filter", run["params"])
+        self.assertNotIn("rule_mismatch", run["statistics"]["filter_counts"])
+        steps = self.service.run_provenance("run-1")["steps"]
+        self.assertNotIn("record_filter", steps[1]["params"])
+
+    def test_same_expression_reproduces_identical_hashes(self):
+        self.sample(key="k1", sample_id="s1")
+        self.sample(key="k2", sample_id="s2")
+        rule = {"any": [{"field": "info.DP", "op": "gte", "value": 50}, {"field": "id", "op": "exists"}]}
+        first = self.start_run({"record_filter": rule}, key="r1", run_id="run-1", sample_id="s1")
+        second = self.start_run({"record_filter": rule}, key="r2", run_id="run-2", sample_id="s2")
+        self.assertEqual(first["statistics"], second["statistics"])
+        self.assertEqual(first["provenance_head"], second["provenance_head"])
+        self.assertEqual(
+            self.service.run_provenance("run-1")["steps"],
+            self.service.run_provenance("run-2")["steps"],
+        )
+
+    def test_provenance_reproduction_replays_the_rule(self):
+        self.sample()
+        self.start_run({"min_dp": 10, "record_filter": {"field": "qual", "op": "gte", "value": 50}})
+        payload = self.service.run_provenance("run-1")
+        self.assertTrue(payload["chain_verified"])
+        self.assertTrue(payload["reproduction_verified"])
+        self.assertTrue(payload["verified"])
+        # Tampering with the stored rule result is detected by reproduction.
+        document = self.service._document("run-1")
+        document["statistics"]["filter_counts"]["rule_mismatch"] = 99
+        self.service.store.connection.execute(
+            "UPDATE runs SET document = ? WHERE id = ?", (self.service.store.encode(document), "run-1")
+        )
+        self.assertFalse(self.service.run_provenance("run-1")["verified"])
+
+    def test_invalid_expressions_are_rejected_without_saving(self):
+        self.sample()
+        deep = {"field": "chrom", "op": "eq", "value": "chr1"}
+        for _ in range(16):
+            deep = {"not": deep}
+        cases = [
+            (None, "non-empty object"),
+            ("chrom", "non-empty object"),
+            ({}, "non-empty object"),
+            ({"all": []}, "non-empty array"),
+            ({"any": []}, "non-empty array"),
+            ({"all": [{"field": "chrom", "op": "eq", "value": "chr1"}], "not": {"field": "dp", "op": "exists"}}, "exactly one"),
+            ({"field": "chrom", "op": "eq", "value": "chr1", "all": [{"field": "dp", "op": "exists"}]}, "exactly one"),
+            ({"not": [{"field": "chrom", "op": "eq", "value": "chr1"}]}, "single expression"),
+            ({"op": "eq", "value": "chr1"}, "must contain field and op"),
+            ({"field": "chrom", "value": "chr1"}, "must contain field and op"),
+            ({"field": "gene", "op": "eq", "value": "BRCA1"}, "not supported"),
+            ({"field": "info.", "op": "exists"}, "not supported"),
+            ({"field": "chrom", "op": "between", "value": "chr1"}, "not supported"),
+            ({"field": "chrom", "op": "eq"}, "requires a value"),
+            ({"field": "chrom", "op": "exists", "value": True}, "does not accept a value"),
+            ({"field": "chrom", "op": "lt", "value": 5}, "not valid for field"),
+            ({"field": "alt", "op": "gte", "value": 5}, "not valid for field"),
+            ({"field": "pos", "op": "lt", "value": "5"}, "finite number"),
+            ({"field": "pos", "op": "eq", "value": "5"}, "finite number"),
+            ({"field": "qual", "op": "eq", "value": True}, "finite number"),
+            ({"field": "chrom", "op": "eq", "value": 5}, "must be a string"),
+            ({"field": "chrom", "op": "in", "value": []}, "non-empty array"),
+            ({"field": "chrom", "op": "in", "value": "chr1"}, "non-empty array"),
+            ({"field": "chrom", "op": "in", "value": ["chr1", 5]}, "must be a string"),
+            ({"field": "chrom", "op": "eq", "value": "chr1", "extra": 1}, "unknown keys"),
+            (deep, "must not exceed 16 levels"),
+        ]
+        for index, (rule, pattern) in enumerate(cases):
+            with self.subTest(rule=rule), self.assertRaisesRegex(ValidationError, pattern):
+                self.start_run({"record_filter": rule}, key=f"bad-{index}", run_id=f"run-bad-{index}")
+            with self.subTest(rule=rule), self.assertRaises(NotFoundError):
+                self.service.get_run(f"run-bad-{index}")
+        # A rejected run consumed neither the run id nor the idempotency key.
+        run = self.start_run(
+            {"record_filter": {"field": "chrom", "op": "eq", "value": "chr1"}}, key="bad-0", run_id="run-bad-0"
+        )
+        self.assertEqual("succeeded", run["status"])
+
+    def test_maximum_nesting_depth_is_accepted(self):
+        self.sample()
+        rule = {"field": "chrom", "op": "eq", "value": "chr1"}
+        for _ in range(15):
+            rule = {"not": rule}
+        run = self.start_run({"record_filter": rule})
+        # 15 negations of "chrom == chr1": non-chr1 records survive.
+        self.assertEqual([8, 9, 10, 11], self.kept_lines())
+
+
+class RecordFilterHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def post(self, path, payload, key):
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=body,
+            headers={"Content-Type": "application/json", "Idempotency-Key": key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            status = error.code
+            error.close()
+            return status, body
+
+    def test_invalid_record_filter_is_a_400_and_saves_nothing(self):
+        status, body = self.post(
+            "/samples/s1/runs",
+            {"id": "run-1", "params": {"record_filter": {"all": []}}},
+            "run-1",
+        )
+        self.assertEqual(400, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertIn("record_filter", error["message"])
+        # Neither the run nor the idempotency response was stored.
+        status, body = self.post(
+            "/samples/s1/runs",
+            {"id": "run-1", "params": {"record_filter": {"field": "dp", "op": "gte", "value": 10}}},
+            "run-1",
+        )
+        self.assertEqual(201, status)
+        run = json.loads(body)
+        self.assertEqual({"field": "dp", "op": "gte", "value": 10}, run["params"]["record_filter"])
+        self.assertIn("rule_mismatch", run["statistics"]["filter_counts"])
+
+
 class ExportHttpTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
