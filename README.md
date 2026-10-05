@@ -451,6 +451,69 @@ re-reads the stored sample VCF, re-executes all four steps with the stored
 variants. `verified` is the conjunction of both; the endpoint never rewrites the
 stored trail.
 
+### Step-level lineage manifest
+
+The run entry point `variantrail.pipeline.execute(parsed, vcf_text, params,
+lineage=False)` accepts an optional boolean `lineage` argument. It is off by
+default, and an off run returns exactly the legacy result object. With
+`lineage=True` the result gains one extra key, `lineage`, a self-contained
+manifest that needs no logs or stored files to explain the result:
+
+```json
+{"input":{"sha256":"<sha256 of the VCF text>"},
+ "params":{<complete parameter snapshot taken at call time>},
+ "steps":[{"input_sha256":"<digest of the step input>",
+           "name":"ingest",
+           "output_sha256":"<digest of the step output>",
+           "params":{<parameters the step actually used>},
+           "previous_sha256":"0000...0000",
+           "sha256":"<this record's digest>"},
+          ...],
+ "final_sha256":"<digest of the last record in the chain>"}
+```
+
+- `input.sha256` is the SHA-256 of the VCF text and equals the first record's
+  `input_sha256`.
+- `params` is a complete snapshot of the normalized parameters deep-copied via a
+  JSON round trip before any step runs. Mutating the caller's parameter object
+  after the call cannot change the returned manifest, and a parameter value that
+  cannot be represented as JSON makes `execute` raise `TypeError` before any
+  step executes.
+- `steps` lists only the steps that actually executed, in real execution order.
+  An empty input or a filter that removes every variant still records the steps
+  that ran; a step skipped by a condition never appears as an executed record.
+- The first record's `previous_sha256` is exactly 64 `0` characters; every
+  later record carries the previous record's `sha256`, and `final_sha256`
+  equals the last record's `sha256`.
+
+Each record digest is the SHA-256 of the record body over every field except
+`sha256` itself, rendered as canonical JSON: `json.dumps(body,
+ensure_ascii=False, separators=(",", ":"), sort_keys=True)` encoded as UTF-8.
+Object keys are sorted by Unicode code point, array order is preserved, and
+numbers, booleans and `null` keep their JSON types. Because every input digest
+is canonical, dictionaries whose keys are ordered differently but whose values
+are equal hash identically.
+
+The manifest is deterministic: identical input content, equivalent parameters
+and identical step outputs produce a byte-identical manifest on repeated runs,
+and changing any input, parameter or step output changes every record digest
+from the first affected record through `final_sha256`.
+
+### Verifying a lineage manifest
+
+`variantrail.verify_lineage(manifest)` (also exported from the package root) is
+the public verification entry point. It recomputes every record digest and the
+chain linkage and returns `True` only when the whole manifest is consistent:
+each `previous_sha256` chains correctly from the 64-zero head, each `sha256`
+recomputes from the other fields, the first input digest matches `input.sha256`,
+the top-level parameter snapshot matches the parameters carried by the steps,
+and `final_sha256` closes the chain. It never mutates its argument.
+
+Any tampered field, swapped or missing record, wrong chain-head value or
+mismatching `final_sha256` returns `False`. A non-object argument, a missing
+required field, or a digest that is not a 64-character lowercase hexadecimal
+string raises `ValueError`.
+
 ## Errors
 
 ```json

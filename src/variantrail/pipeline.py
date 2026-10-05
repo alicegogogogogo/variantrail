@@ -5,6 +5,7 @@ from typing import Any
 
 from .annotate import annotate, table_sha256
 from .errors import ValidationError
+from .lineage import build_lineage, json_snapshot
 from .provenance import digest, digest_text, step
 from .recordfilter import evaluate_record_filter, normalize_record_filter
 
@@ -56,8 +57,22 @@ def normalize_params(raw: Any) -> dict[str, Any]:
     return params
 
 
-def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Run ingest -> filter -> annotate -> summarize and record each link."""
+def execute(
+    parsed: dict[str, Any],
+    vcf_text: str,
+    params: dict[str, Any],
+    lineage: bool = False,
+) -> dict[str, Any]:
+    """Run ingest -> filter -> annotate -> summarize and record each link.
+
+    With ``lineage=True`` the result additionally carries a ``lineage``
+    manifest; without it the result is byte-for-byte identical to the legacy
+    contract. The parameter snapshot is taken before any step executes, so an
+    unrepresentable parameter value fails with ``TypeError`` up front.
+    """
+    if not isinstance(lineage, bool):
+        raise TypeError("lineage must be a boolean")
+    params_snapshot = json_snapshot(params) if lineage else None
     steps: list[dict[str, Any]] = []
 
     records = parsed["records"]
@@ -129,7 +144,15 @@ def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> di
     statistics = summarize(records, variants, counts)
     steps.append(step(4, "summarize", {}, steps[-1]["output_sha256"], digest(statistics), steps[-1]["hash"]))
 
-    return {"filter_counts": counts, "provenance": steps, "statistics": statistics, "variants": variants}
+    result: dict[str, Any] = {
+        "filter_counts": counts,
+        "provenance": steps,
+        "statistics": statistics,
+        "variants": variants,
+    }
+    if lineage:
+        result["lineage"] = build_lineage(vcf_text, params_snapshot, steps)
+    return result
 
 
 def record_reason(record: dict[str, Any], params: dict[str, Any]) -> str | None:
