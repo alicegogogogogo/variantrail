@@ -59,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_run(parts[1])
         if len(parts) == 3 and parts[0] == "runs" and parts[2] == "variants" and self.command == "GET":
             return 200, self.service.run_variants(parts[1])
+        if len(parts) == 3 and parts[0] == "runs" and parts[2] == "qc" and self.command == "GET":
+            return 200, self.service.run_qc(parts[1])
         if len(parts) == 4 and parts[0] == "runs" and parts[2] == "exports" and self.command == "GET":
             content_type, body = self.service.run_export(parts[1], parts[3])
             return 200, RawBody(content_type, body)

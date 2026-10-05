@@ -7,6 +7,7 @@ from .export import render_jsonl, render_tsv, render_vcf
 from .model import identifier, run_view, sample_view
 from .pipeline import execute, normalize_params
 from .provenance import digest_text, verify_chain
+from .qc import run_qc as summarize_qc
 from .store import Store
 from .vcf import parse_vcf
 
@@ -105,6 +106,10 @@ class VariantRail:
     def run_variants(self, run_id: str) -> dict[str, Any]:
         variants = self._document(run_id)["variants"]
         return {"count": len(variants), "run_id": run_id, "variants": variants}
+
+    def run_qc(self, run_id: str) -> dict[str, Any]:
+        """Read-only QC summary of a finished run's stored variants."""
+        return summarize_qc(self._document(run_id))
 
     def run_export(self, run_id: str, format: str) -> tuple[str, bytes]:
         """Render the retained variants of a saved run; the run is unchanged."""
