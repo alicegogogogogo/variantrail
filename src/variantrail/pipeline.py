@@ -6,10 +6,12 @@ from typing import Any
 from .annotate import annotate, table_sha256
 from .errors import ValidationError
 from .provenance import digest, digest_text, step
+from .recordfilter import evaluate_record_filter, normalize_record_filter
 
 PARSER_VERSION = "variantrail-vcf-1"
 ALLOWED_IMPACTS = ("HIGH", "LOW", "MODERATE", "MODIFIER", "UNKNOWN")
 RECORD_FILTER_REASONS = ("dp_below_min", "not_pass", "qual_below_min")
+RULE_MISMATCH = "rule_mismatch"
 
 
 def normalize_params(raw: Any) -> dict[str, Any]:
@@ -18,7 +20,7 @@ def normalize_params(raw: Any) -> dict[str, Any]:
         raw = {}
     if not isinstance(raw, dict):
         raise ValidationError("params must be an object")
-    unknown = sorted(set(raw) - {"genes", "impacts", "min_dp", "min_qual", "pass_only"})
+    unknown = sorted(set(raw) - {"genes", "impacts", "min_dp", "min_qual", "pass_only", "record_filter"})
     if unknown:
         raise ValidationError(f"params contains unknown fields: {', '.join(unknown)}")
 
@@ -49,6 +51,8 @@ def normalize_params(raw: Any) -> dict[str, Any]:
     for impact in params["impacts"]:
         if impact not in ALLOWED_IMPACTS:
             raise ValidationError(f"params.impacts entry {impact} is not one of {', '.join(ALLOWED_IMPACTS)}")
+    if "record_filter" in raw:
+        params["record_filter"] = normalize_record_filter(raw["record_filter"])
     return params
 
 
@@ -68,7 +72,11 @@ def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> di
         )
     )
 
-    counts = dict.fromkeys(RECORD_FILTER_REASONS, 0)
+    reasons = list(RECORD_FILTER_REASONS)
+    expression = params.get("record_filter")
+    if expression is not None:
+        reasons.append(RULE_MISMATCH)
+    counts = dict.fromkeys(reasons, 0)
     kept: list[dict[str, Any]] = []
     for record in records:
         reason = record_reason(record, params)
@@ -76,11 +84,18 @@ def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> di
             kept.append(record)
         else:
             counts[reason] += 1
+    filter_params: dict[str, Any] = {
+        "min_dp": params["min_dp"],
+        "min_qual": params["min_qual"],
+        "pass_only": params["pass_only"],
+    }
+    if expression is not None:
+        filter_params["record_filter"] = expression
     steps.append(
         step(
             2,
             "filter",
-            {"min_dp": params["min_dp"], "min_qual": params["min_qual"], "pass_only": params["pass_only"]},
+            filter_params,
             steps[-1]["output_sha256"],
             digest({"filter_counts": counts, "records": kept}),
             steps[-1]["hash"],
@@ -131,6 +146,9 @@ def record_reason(record: dict[str, Any], params: dict[str, Any]) -> str | None:
             return "dp_below_min"
     elif record["dp"] < params["min_dp"]:
         return "dp_below_min"
+    expression = params.get("record_filter")
+    if expression is not None and not evaluate_record_filter(expression, record):
+        return RULE_MISMATCH
     return None
 
 

@@ -270,6 +270,147 @@ class VariantRailTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "exactly id and optional params"):
             self.service.create_run("s1", {"params": {}}, "k2")
 
+    # --- record filter -----------------------------------------------------
+
+    def test_record_filter_filters_records_as_rule_mismatch(self):
+        self.sample()
+        run = self.start_run({"record_filter": {"field": "chrom", "op": "eq", "value": "chr1"}})
+        statistics = run["statistics"]
+        self.assertEqual(3, statistics["records_kept"])
+        self.assertEqual(4, statistics["records_filtered"])
+        self.assertEqual(4, statistics["filter_counts"]["rule_mismatch"])
+        self.assertEqual(
+            {"allele_filtered": 0, "dp_below_min": 0, "not_pass": 0, "qual_below_min": 0,
+             "rule_mismatch": 4},
+            statistics["filter_counts"],
+        )
+        self.assertEqual([5, 6, 7], [variant["line"] for variant in self.service.run_variants(run["id"])["variants"]])
+        self.assertEqual(statistics["records_filtered"], sum(statistics["filter_counts"].values()))
+
+    def test_record_filter_runs_after_pass_qual_dp_and_before_allele_lists(self):
+        self.sample()
+        run = self.start_run({
+            "pass_only": True, "min_qual": 30, "min_dp": 10,
+            "record_filter": {"field": "chrom", "op": "eq", "value": "chr1"},
+        })
+        counts = run["statistics"]["filter_counts"]
+        # line 7 fails pass_only, line 6 fails qual, line 9 has no DP; the
+        # chr7/chr12/chr17 records that pass the first three mismatch the rule.
+        self.assertEqual({"allele_filtered": 0, "dp_below_min": 1, "not_pass": 1,
+                          "qual_below_min": 1, "rule_mismatch": 3}, counts)
+        self.assertEqual(1, run["statistics"]["records_kept"])
+        self.assertEqual([5], [variant["line"] for variant in self.service.run_variants(run["id"])["variants"]])
+
+    def test_rule_mismatch_key_is_present_even_when_zero(self):
+        from variantrail.pipeline import execute, normalize_params
+
+        self.sample()
+        expression = {"field": "pos", "op": "gt", "value": 0}
+        run = self.start_run({"record_filter": expression})
+        counts = run["statistics"]["filter_counts"]
+        self.assertIn("rule_mismatch", counts)
+        self.assertEqual(0, counts["rule_mismatch"])
+        # The key also belongs to the annotate step's filter counts (step 3 output).
+        sample = self.service.get_sample("s1")
+        result = execute(
+            {"records": sample["records"]}, sample["vcf"], normalize_params({"record_filter": expression})
+        )
+        self.assertIn("rule_mismatch", result["filter_counts"])
+        steps = self.service.run_provenance(run["id"])["steps"]
+        self.assertEqual(steps[2]["output_sha256"], result["provenance"][2]["output_sha256"])
+        self.assertTrue(self.service.run_provenance(run["id"])["verified"])
+
+    def test_record_filter_stored_expression_is_normalized_and_reproduced(self):
+        self.sample()
+        expression = {
+            "all": [
+                {"field": "alt", "op": "in", "value": ["T", "A"]},
+                {"not": {"field": "info.ABSENT", "op": "exists"}},
+            ]
+        }
+        run = self.start_run({"record_filter": expression})
+        saved = run["params"]["record_filter"]
+        self.assertEqual(["A", "T"], saved["all"][0]["value"])  # in-array sorted
+        self.assertEqual(expression["all"][1], saved["all"][1])
+        # The filter provenance step persists the same canonical expression.
+        steps = self.service.run_provenance(run["id"])["steps"]
+        self.assertEqual(saved, steps[1]["params"]["record_filter"])
+        self.assertNotIn("record_filter", steps[2]["params"])
+        provenance = self.service.run_provenance(run["id"])
+        self.assertTrue(provenance["verified"])
+        self.assertTrue(provenance["reproduction_verified"])
+
+    def test_record_filter_default_params_still_hold_only_five_keys(self):
+        self.sample()
+        run = self.start_run()
+        self.assertEqual(
+            {"genes", "impacts", "min_dp", "min_qual", "pass_only"}, set(run["params"])
+        )
+        steps = self.service.run_provenance(run["id"])["steps"]
+        self.assertEqual({"min_dp", "min_qual", "pass_only"}, set(steps[1]["params"]))
+        self.assertNotIn("rule_mismatch", run["statistics"]["filter_counts"])
+
+    def test_record_filter_same_inputs_and_params_hash_identically(self):
+        self.sample(key="k1", sample_id="s1")
+        self.sample(key="k2", sample_id="s2")
+        params = {"record_filter": {"all": [
+            {"field": "pos", "op": "gte", "value": 55019017},
+            {"field": "qual", "op": "gte", "value": 50},
+        ]}}
+        first = self.start_run(params=params, key="r1", run_id="run-1", sample_id="s1")
+        second = self.start_run(params=params, key="r2", run_id="run-2", sample_id="s2")
+        self.assertEqual(first["statistics"], second["statistics"])
+        self.assertEqual(first["provenance_head"], second["provenance_head"])
+        self.assertEqual(
+            self.service.run_provenance("run-1")["steps"],
+            self.service.run_provenance("run-2")["steps"],
+        )
+        # A differently ordered but equivalent in-list normalizes to one hash.
+        reordered = {"record_filter": {"field": "chrom", "op": "in", "value": ["chr7", "chr1"]}}
+        canonical = {"record_filter": {"field": "chrom", "op": "in", "value": ["chr1", "chr7"]}}
+        a = self.start_run(params=reordered, key="r3", run_id="run-3", sample_id="s1")
+        b = self.start_run(params=canonical, key="r4", run_id="run-4", sample_id="s1")
+        self.assertEqual(a["provenance_head"], b["provenance_head"])
+
+    def test_record_filter_different_expressions_change_the_hash(self):
+        self.sample()
+        first = self.start_run(
+            {"record_filter": {"field": "chrom", "op": "eq", "value": "chr1"}}, key="r1", run_id="run-1"
+        )
+        second = self.start_run(
+            {"record_filter": {"field": "chrom", "op": "eq", "value": "chr7"}}, key="r2", run_id="run-2"
+        )
+        self.assertNotEqual(first["provenance_head"], second["provenance_head"])
+
+    def test_invalid_record_filter_is_rejected_without_saving_run_or_idempotency(self):
+        self.sample()
+        bad_expressions = [
+            {"field": "nope", "op": "eq", "value": "x"},
+            {"field": "chrom", "op": "nope", "value": "x"},
+            {"all": [{"field": "chrom", "op": "eq", "value": "x"}],
+             "any": [{"field": "chrom", "op": "eq", "value": "x"}]},
+            {"all": []},
+            {"field": "chrom", "op": "lt", "value": 1},
+            {"field": "chrom", "op": "exists", "value": "x"},
+            {"field": "chrom", "op": "eq"},
+            {"field": "chrom", "op": "in", "value": []},
+        ]
+        for expression in bad_expressions:
+            with self.subTest(expression=expression):
+                with self.assertRaises(ValidationError):
+                    self.start_run({"record_filter": expression}, key="shared-key")
+        # The failed attempts persisted neither the run nor an idempotency response.
+        with self.assertRaises(NotFoundError):
+            self.service.get_run("run-1")
+        run = self.start_run({"record_filter": {"field": "chrom", "op": "eq", "value": "chr1"}},
+                             key="shared-key")
+        self.assertEqual("succeeded", run["status"])
+
+    def test_record_filter_must_be_an_object(self):
+        self.sample()
+        with self.assertRaisesRegex(ValidationError, "record_filter"):
+            self.start_run({"record_filter": []}, key="k1")
+
     def test_run_and_sample_lookups_are_not_found(self):
         with self.assertRaises(NotFoundError):
             self.service.create_run("missing", {"id": "run-1"}, "k1")

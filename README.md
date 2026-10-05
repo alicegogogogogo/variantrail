@@ -126,8 +126,9 @@ besides it. The run executes synchronously, so a returned run is always
 
 ### Run parameters
 
-Every key is optional and the stored `params` object always contains all five.
-`genes` and `impacts` are stored sorted, so request order never changes a hash.
+Every key is optional; the stored `params` object always contains all five
+core keys, plus `record_filter` only when one was supplied. `genes` and
+`impacts` are stored sorted, so request order never changes a hash.
 
 - `pass_only` (boolean, default `false`) — keep only records whose `FILTER` is
   exactly `["PASS"]`.
@@ -141,9 +142,50 @@ Every key is optional and the stored `params` object always contains all five.
 - `impacts` (array, default `[]` = no restriction) — after annotation keep only
   alleles whose impact is listed; values must come from `HIGH`, `MODERATE`,
   `LOW`, `MODIFIER`, `UNKNOWN`.
+- `record_filter` (expression object, optional) — a structured, nested
+  record-level predicate applied after `pass_only`, `min_qual` and `min_dp` and
+  before the gene/impact allowlists. When omitted the stored `params` object
+  holds only the other five keys and the run is byte-for-byte identical to an
+  older run; when present it is stored, normalized, under `record_filter`.
 
 A record that passed the record-level filters but whose alleles are all removed
 by `genes`/`impacts` is dropped as well.
+
+### Record filter expressions
+
+Every expression node is either a logical node or a condition object; mixing
+both forms in one node is rejected:
+
+- `{"all":[<expr>, ...]}` — true when every child is true; the array is
+  non-empty.
+- `{"any":[<expr>, ...]}` — true when at least one child is true; the array is
+  non-empty.
+- `{"not":<expr>}` — true when the single child expression is false.
+- `{"field":"<field>","op":"<op>","value":<value>}` — a condition; `value` is
+  required for every op except `exists`, which must omit it.
+
+`field` is one of `chrom`, `pos`, `id`, `ref`, `alt`, `qual`, `dp`, `filter`
+or `info.<KEY>` (any INFO key). `op` is one of:
+
+- `eq` — direct scalar comparison. For `alt` and `filter` the condition is
+  true when any element equals the value.
+- `in` — `value` must be a non-empty array; true on membership. For `alt` and
+  `filter` it is true when any record element appears in the array.
+- `lt`, `lte`, `gt`, `gte` — numeric ordering; `value` must be a number and
+  the field must be `pos`, `qual`, `dp`, or an `info.<KEY>` whose stored value
+  parses fully to a finite decimal number.
+- `exists` — takes no `value`; true when the field is present and non-null. An
+  INFO bare flag counts as present.
+
+A missing field, a `null` value (`ID`/`QUAL` `.`), or an INFO value that does
+not parse as a finite decimal makes every op other than `exists` false; wrap
+such a condition in `not` to test for absence. The stored expression is
+normalized (`in` arrays are sorted, numeric values stored as floats), so
+equivalent submissions hash identically. Expressions may nest at most 16
+levels. Any unknown field or op, malformed node, empty `all`/`any`,
+field/op type mismatch, `exists` with a `value`, another op without one, or
+nesting beyond 16 levels makes run creation return 400 `validation_error`
+without saving the run or the idempotency response.
 
 ### Filter accounting and statistics
 
@@ -151,8 +193,11 @@ by `genes`/`impacts` is dropped as well.
 precedence: `not_pass` (`pass_only` set and `FILTER` is not `["PASS"]`);
 `qual_below_min` (`QUAL` below `min_qual`, or `null` while `min_qual > 0`);
 `dp_below_min` (`DP` below `min_dp`, or `null` while `min_dp > 0`);
-`allele_filtered` (survived the first three but no allele survived the
-allowlists). Hence `records_filtered == sum(filter_counts.values())` and
+`rule_mismatch` (a `record_filter` was supplied and its expression evaluated
+false for the record — present in the run statistics and annotate-step counts,
+even when zero); `allele_filtered` (survived the record-level filters but no
+allele survived the allowlists). Hence
+`records_filtered == sum(filter_counts.values())` and
 `records_kept == records_total - records_filtered` always hold.
 
 `alleles_total` counts every ALT allele of every record and `alleles_kept`
@@ -380,9 +425,17 @@ bytes of `canonical(x)`. The four links are:
 | step | name | params | input_sha256 | output_sha256 |
 | --- | --- | --- | --- | --- |
 | 1 | `ingest` | `{"parser_version":"variantrail-vcf-1"}` | SHA-256 of the VCF text | `H({"records":<parsed records>})` |
-| 2 | `filter` | `min_dp`, `min_qual`, `pass_only` | step 1 `output_sha256` | `H({"filter_counts":<3 record keys>,"records":<kept records>})` |
-| 3 | `annotate` | `annotation_table_sha256`, `genes`, `impacts` | step 2 `output_sha256` | `H({"filter_counts":<4 keys>,"variants":<variants>})` |
+| 2 | `filter` | `min_dp`, `min_qual`, `pass_only`, plus the normalized `record_filter` when supplied | step 1 `output_sha256` | `H({"filter_counts":<record-reason keys>,"records":<kept records>})` |
+| 3 | `annotate` | `annotation_table_sha256`, `genes`, `impacts` | step 2 `output_sha256` | `H({"filter_counts":<record keys plus allele_filtered>,"variants":<variants>})` |
 | 4 | `summarize` | `{}` | step 3 `output_sha256` | `H(<statistics>)` |
+
+Without a `record_filter` the step-2 filter counts hold the three original
+record-reason keys and the step params hold only `min_dp`, `min_qual` and
+`pass_only`, so every link hash is unchanged from the five-parameter contract.
+With one, `rule_mismatch` is added (after `dp_below_min`) and the normalized
+expression is part of the step-2 params; reproduction re-runs the saved
+expression and the rule result, statistics, variants and all four step output
+hashes feed the existing `verified` verdict.
 
 Each link's own hash covers the previous link, so the trail is tamper-evident:
 
