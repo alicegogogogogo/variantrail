@@ -106,6 +106,81 @@ class VariantRail:
         variants = self._document(run_id)["variants"]
         return {"count": len(variants), "run_id": run_id, "variants": variants}
 
+    def run_qc(self, run_id: str) -> dict[str, Any]:
+        """Summarize the retained variants of a saved run; read-only.
+
+        Only the stored variants and run metadata are read: no filter or
+        annotation step re-runs and the run document is never rewritten.
+        """
+        document = self._document(run_id)
+        variants = document["variants"]
+
+        total = len(variants)
+        pass_records = 0
+        missing_qual = 0
+        missing_dp = 0
+        multiallelic = 0
+        quals: list[float] = []
+        dps: list[int] = []
+        allele_counts = dict.fromkeys(("deletion", "insertion", "mnv", "snv"), 0)
+        transitions = 0
+        transversions = 0
+        non_acgt_snv = 0
+        for variant in variants:
+            if variant["filter"] == ["PASS"]:
+                pass_records += 1
+            if variant["qual"] is None:
+                missing_qual += 1
+            else:
+                quals.append(variant["qual"])
+            if variant["dp"] is None:
+                missing_dp += 1
+            else:
+                dps.append(variant["dp"])
+            annotations = variant["annotations"]
+            if len(annotations) >= 2:
+                multiallelic += 1
+            ref = variant["ref"]
+            for annotation in annotations:
+                allele = annotation["allele"]
+                category = _allele_class(ref, allele)
+                allele_counts[category] += 1
+                if category == "snv":
+                    kind = _snv_kind(ref, allele)
+                    if kind == "ti":
+                        transitions += 1
+                    elif kind == "tv":
+                        transversions += 1
+                    else:
+                        non_acgt_snv += 1
+
+        return {
+            "alleles": {
+                "deletion": allele_counts["deletion"],
+                "insertion": allele_counts["insertion"],
+                "mnv": allele_counts["mnv"],
+                "non_acgt_snv": non_acgt_snv,
+                "snv": allele_counts["snv"],
+                "ti_tv_ratio": None if transversions == 0 else transitions / transversions,
+                "total": sum(allele_counts.values()),
+                "transitions": transitions,
+                "transversions": transversions,
+            },
+            "provenance_head": document["provenance"][-1]["hash"],
+            "records": {
+                "dp": _value_summary(dps),
+                "missing_dp": missing_dp,
+                "missing_qual": missing_qual,
+                "multiallelic": multiallelic,
+                "pass": pass_records,
+                "qual": _value_summary(quals),
+                "total": total,
+            },
+            "run_id": run_id,
+            "sample_id": document["sample_id"],
+            "sample_sha256": document["sample_sha256"],
+        }
+
     def run_export(self, run_id: str, format: str) -> tuple[str, bytes]:
         """Render the retained variants of a saved run; the run is unchanged."""
         if format == "jsonl":
@@ -257,6 +332,37 @@ class VariantRail:
         if not row:
             raise NotFoundError(f"run {run_id} was not found")
         return self.store.decode(row["document"])
+
+
+_ACGT = frozenset("ACGT")
+_TRANSITIONS = frozenset((("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")))
+
+
+def _allele_class(ref: str, allele: str) -> str:
+    """Length-only class of one REF/ALT pair: snv, mnv, insertion or deletion."""
+    ref_length = len(ref)
+    allele_length = len(allele)
+    if ref_length == 1 and allele_length == 1:
+        return "snv"
+    if ref_length == allele_length:
+        return "mnv"
+    if allele_length > ref_length:
+        return "insertion"
+    return "deletion"
+
+
+def _snv_kind(ref: str, allele: str) -> str | None:
+    """``ti``/``tv`` for ACGT SNV pairs; ``None`` when either base is not ACGT."""
+    if ref in _ACGT and allele in _ACGT:
+        return "ti" if (ref, allele) in _TRANSITIONS else "tv"
+    return None
+
+
+def _value_summary(values: list[Any]) -> dict[str, Any]:
+    """Count and bounds of non-null QUAL/DP values; null bounds when empty."""
+    if not values:
+        return {"count": 0, "max": None, "min": None}
+    return {"count": len(values), "max": max(values), "min": min(values)}
 
 
 def _alleles(document: dict[str, Any]) -> dict[tuple[str, int, str, str], dict[str, Any]]:

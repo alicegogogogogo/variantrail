@@ -532,6 +532,180 @@ class VariantRailTests(unittest.TestCase):
             self.service.run_provenance("run-2")["steps"],
         )
 
+    # --- quality control ---------------------------------------------------
+
+    def test_qc_summarizes_retained_records_and_alleles(self):
+        self.sample()
+        run = self.start_run()
+        payload = self.service.run_qc("run-1")
+        self.assertEqual("run-1", payload["run_id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual(run["sample_sha256"], payload["sample_sha256"])
+        self.assertEqual(run["provenance_head"], payload["provenance_head"])
+        self.assertEqual(
+            {
+                "total": 7,
+                "pass": 6,
+                "missing_qual": 1,
+                "missing_dp": 1,
+                "multiallelic": 1,
+                "qual": {"count": 6, "min": 20.0, "max": 99.0},
+                "dp": {"count": 6, "min": 5, "max": 60},
+            },
+            payload["records"],
+        )
+        self.assertEqual(
+            {
+                "total": 8,
+                "snv": 7,
+                "mnv": 0,
+                "insertion": 1,
+                "deletion": 0,
+                "transitions": 4,
+                "transversions": 3,
+                "non_acgt_snv": 0,
+                "ti_tv_ratio": 4 / 3,
+            },
+            payload["alleles"],
+        )
+
+    def test_qc_pass_requires_filter_to_be_exactly_single_pass(self):
+        vcf = "\n".join(
+            [
+                PREAMBLE,
+                HEADER,
+                "chr1\t100\t.\tA\tG\t60\tPASS\tDP=42",
+                "chr1\t101\t.\tA\tG\t60\tq10;S50\tDP=42",
+                "chr1\t102\t.\tA\tG\t60\tq10\tDP=42",
+                "chr1\t103\t.\tA\tG\t.\t.\t.",
+            ]
+        ) + "\n"
+        self.sample(vcf=vcf)
+        self.start_run()
+        records = self.service.run_qc("run-1")["records"]
+        self.assertEqual(4, records["total"])
+        self.assertEqual(1, records["pass"])
+        self.assertEqual(1, records["missing_qual"])
+        self.assertEqual(1, records["missing_dp"])
+
+    def test_qc_classifies_alleles_by_length_only(self):
+        cases = [
+            ("A", "G", "snv"),
+            ("AC", "GT", "mnv"),
+            ("AC", "AC", "mnv"),
+            ("G", "GA", "insertion"),
+            ("GAC", "G", "deletion"),
+            ("ACGT", "AC", "deletion"),
+        ]
+        for index, (ref, alt, category) in enumerate(cases):
+            with self.subTest(ref=ref, alt=alt):
+                self.sample(vcf=single(pos=100 + index, ref=ref, alt=alt), key=f"s{index}", sample_id=f"s{index}")
+                self.start_run(key=f"r{index}", run_id=f"run-{index}", sample_id=f"s{index}")
+                alleles = self.service.run_qc(f"run-{index}")["alleles"]
+                self.assertEqual(1, alleles["total"])
+                for name in ("snv", "mnv", "insertion", "deletion"):
+                    self.assertEqual(1 if name == category else 0, alleles[name], name)
+
+    def test_qc_snv_transitions_transversions_and_n_alleles(self):
+        # 4 transition pairs, 4 transversion pairs, 2 N-containing SNVs.
+        rows = [
+            ("chr1", 100, "A", "G"),
+            ("chr1", 101, "G", "A"),
+            ("chr1", 102, "C", "T"),
+            ("chr1", 103, "T", "C"),
+            ("chr1", 104, "A", "C"),
+            ("chr1", 105, "A", "T"),
+            ("chr1", 106, "G", "C"),
+            ("chr1", 107, "C", "G"),
+            ("chr1", 108, "A", "N"),
+            ("chr1", 109, "N", "A"),
+        ]
+        lines = [
+            f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t60\tPASS\tDP=42"
+            for chrom, pos, ref, alt in rows
+        ]
+        self.sample(vcf="\n".join([PREAMBLE, HEADER, *lines]) + "\n")
+        self.start_run()
+        alleles = self.service.run_qc("run-1")["alleles"]
+        self.assertEqual(10, alleles["total"])
+        self.assertEqual(10, alleles["snv"])
+        self.assertEqual(4, alleles["transitions"])
+        self.assertEqual(4, alleles["transversions"])
+        self.assertEqual(2, alleles["non_acgt_snv"])
+        self.assertEqual(1.0, alleles["ti_tv_ratio"])
+
+    def test_qc_ti_tv_ratio_is_null_without_transversions(self):
+        self.sample(vcf=single(pos=100, ref="A", alt="G"))
+        self.start_run()
+        alleles = self.service.run_qc("run-1")["alleles"]
+        self.assertEqual(1, alleles["transitions"])
+        self.assertEqual(0, alleles["transversions"])
+        self.assertIsNone(alleles["ti_tv_ratio"])
+
+    def test_qc_multiallelic_counts_retained_annotations_only(self):
+        vcf = "\n".join(
+            [
+                PREAMBLE,
+                HEADER,
+                "chr12\t25245350\t.\tC\tA,T\t80\tPASS\tDP=60",
+                "chr1\t100\t.\tA\tG,T\t60\tPASS\tDP=60",
+            ]
+        ) + "\n"
+        self.sample(vcf=vcf)
+        self.start_run()
+        payload = self.service.run_qc("run-1")
+        self.assertEqual(2, payload["records"]["multiallelic"])
+        self.assertEqual(4, payload["alleles"]["total"])
+
+    def test_qc_empty_run_is_zero_filled_with_null_bounds(self):
+        self.sample()
+        self.start_run({"genes": ["NO_SUCH_GENE"]})
+        payload = self.service.run_qc("run-1")
+        self.assertEqual(
+            {
+                "total": 0,
+                "pass": 0,
+                "missing_qual": 0,
+                "missing_dp": 0,
+                "multiallelic": 0,
+                "qual": {"count": 0, "min": None, "max": None},
+                "dp": {"count": 0, "min": None, "max": None},
+            },
+            payload["records"],
+        )
+        self.assertEqual(
+            {
+                "total": 0,
+                "snv": 0,
+                "mnv": 0,
+                "insertion": 0,
+                "deletion": 0,
+                "transitions": 0,
+                "transversions": 0,
+                "non_acgt_snv": 0,
+                "ti_tv_ratio": None,
+            },
+            payload["alleles"],
+        )
+
+    def test_qc_unknown_run_is_not_found(self):
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.run_qc("missing")
+
+    def test_qc_is_byte_stable_and_read_only(self):
+        self.sample()
+        self.start_run()
+        before = self.service._document("run-1")
+        jsonl_before = self.service.run_export("run-1", "jsonl")[1]
+        first = self.service.run_qc("run-1")
+        second = self.service.run_qc("run-1")
+        self.assertEqual(first, second)
+        canonical = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        self.assertEqual(canonical(first).encode(), canonical(second).encode())
+        self.assertEqual(before, self.service._document("run-1"))
+        self.assertEqual(jsonl_before, self.service.run_export("run-1", "jsonl")[1])
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+
     # --- comparison --------------------------------------------------------
 
     def test_compare_partitions_alleles_into_shared_and_left_only(self):
@@ -1089,6 +1263,92 @@ class ExportHttpTests(unittest.TestCase):
         self.assertEqual("validation_error", error["code"])
         self.assertEqual("format must be one of jsonl, tsv, vcf", error["message"])
         status, _, body = self.get("/runs/run-1/exports")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", json.loads(body)["error"]["code"])
+
+
+class QcHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1"}, "r1")
+        service.create_run("s1", {"id": "run-2", "params": {"genes": ["NO_SUCH_GENE"]}}, "r2")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_qc_endpoint_returns_the_summary(self):
+        status, content_type, body = self.get("/runs/run-1/qc")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual("run-1", payload["run_id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual(7, payload["records"]["total"])
+        self.assertEqual(6, payload["records"]["pass"])
+        self.assertEqual(1, payload["records"]["missing_qual"])
+        self.assertEqual(1, payload["records"]["missing_dp"])
+        self.assertEqual(1, payload["records"]["multiallelic"])
+        self.assertEqual({"count": 6, "min": 20.0, "max": 99.0}, payload["records"]["qual"])
+        self.assertEqual({"count": 6, "min": 5, "max": 60}, payload["records"]["dp"])
+        self.assertEqual(
+            {
+                "total": 8, "snv": 7, "mnv": 0, "insertion": 1, "deletion": 0,
+                "transitions": 4, "transversions": 3, "non_acgt_snv": 0,
+                "ti_tv_ratio": 4 / 3,
+            },
+            payload["alleles"],
+        )
+        self.assertEqual(
+            {"run_id", "sample_id", "sample_sha256", "provenance_head", "records", "alleles"},
+            set(payload),
+        )
+
+    def test_qc_endpoint_empty_run_is_zero_filled(self):
+        status, _, body = self.get("/runs/run-2/qc")
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        self.assertEqual(0, payload["records"]["total"])
+        self.assertEqual(0, payload["alleles"]["total"])
+        self.assertIsNone(payload["records"]["qual"]["min"])
+        self.assertIsNone(payload["records"]["dp"]["max"])
+        self.assertIsNone(payload["alleles"]["ti_tv_ratio"])
+
+    def test_qc_endpoint_repeated_requests_are_byte_identical(self):
+        _, _, first = self.get("/runs/run-1/qc")
+        _, _, second = self.get("/runs/run-1/qc")
+        self.assertEqual(first, second)
+
+    def test_qc_endpoint_errors_follow_standard_object_and_routes(self):
+        status, content_type, body = self.get("/runs/missing/qc")
+        self.assertEqual(404, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+        # Unknown sub-resource still hits the generic route miss.
+        status, _, body = self.get("/runs/run-1/nope")
         self.assertEqual(404, status)
         self.assertEqual("not_found", json.loads(body)["error"]["code"])
 

@@ -225,6 +225,51 @@ line, so every output stays traceable to the input:
 `line` is the 1-based line of the record in the uploaded VCF and `allele_index`
 is the 1-based VCF ALT index.
 
+### Get run quality control
+
+`GET /runs/run-1/qc` summarizes only the run's already-stored variants and
+metadata: filtering and annotation are not re-executed, no data is rewritten,
+and the run, its variants, its exports and its provenance are unchanged. No
+`Idempotency-Key` is required. Returns HTTP 200:
+
+```json
+{"run_id":"run-1","sample_id":"trio-1","sample_sha256":"...",
+ "provenance_head":"...",
+ "records":{"total":7,"pass":6,"missing_qual":1,"missing_dp":1,"multiallelic":1,
+   "qual":{"count":6,"min":20.0,"max":99.0},
+   "dp":{"count":6,"min":5,"max":60}},
+ "alleles":{"total":8,"snv":7,"mnv":0,"insertion":1,"deletion":0,
+   "transitions":4,"transversions":3,"non_acgt_snv":0,"ti_tv_ratio":1.3333333333333333}}
+```
+
+`records` is scoped to retained records (one entry per stored variant):
+
+- `total` is the number of retained records;
+- `pass` counts only records whose `FILTER` is exactly the single value `PASS`;
+- `missing_qual` and `missing_dp` count records whose `QUAL` / `DP` is `null`;
+- `multiallelic` counts records carrying at least two retained annotations;
+- `qual` and `dp` each give `count`, `min` and `max` over non-null values;
+  when no value is non-null they are `{"count":0,"min":null,"max":null}`.
+
+`alleles.total` counts every retained annotation. Each allele falls into
+exactly one class using only the lengths of `REF` and `annotation.allele`:
+
+- `snv` — both are one base long;
+- `mnv` — equal length greater than one;
+- `insertion` — the ALT is longer;
+- `deletion` — the ALT is shorter.
+
+For SNVs whose two bases are both in `A`, `C`, `G`, `T`, `A↔G` and `C↔T`
+pairs count as `transitions` and every other pair as `transversions`. An SNV
+involving `N` counts as `non_acgt_snv` and enters neither total. `ti_tv_ratio`
+is `transitions / transversions` as a JSON number, or `null` when
+`transversions` is zero. Every count is present even when zero.
+
+A run with no retained variants still returns 200 with all counts zero, the
+`QUAL`/`DP` bounds and `ti_tv_ratio` null. An unknown `run_id` returns 404
+`not_found` with the message `run <run_id> was not found`. Repeated requests
+for the same run return byte-identical JSON.
+
 ### Export run results
 
 `GET /runs/run-1/exports/jsonl`, `GET /runs/run-1/exports/tsv` and
