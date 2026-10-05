@@ -72,6 +72,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.cohort_runs(parts[1], "")
         if len(parts) == 3 and parts[0] == "runs" and parts[2] == "provenance" and self.command == "GET":
             return 200, self.service.run_provenance(parts[1])
+        if len(parts) == 3 and parts[0] == "runs" and parts[2] == "snapshot" and self.command == "GET":
+            return 200, self.service.run_snapshot(parts[1])
+        if len(parts) == 3 and parts[0] == "runs" and parts[2] == "replays" and self.command == "POST":
+            return 201, self.service.replay_run(parts[1], self._body(), self.headers.get("Idempotency-Key"))
         raise NotFoundError("route was not found")
 
     def _handle(self) -> None:

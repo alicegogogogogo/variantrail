@@ -99,6 +99,45 @@ class VariantRail:
 
         return self._idempotent(key, f"create-run:{run_id}", create)
 
+    def replay_run(self, run_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"id"}:
+            raise ValidationError("replay must contain exactly id")
+        new_run_id = identifier(raw["id"], "run id")
+
+        def replay() -> dict[str, Any]:
+            source = self._document(run_id)
+            row = self.store.connection.execute("SELECT 1 FROM runs WHERE id = ?", (new_run_id,)).fetchone()
+            if row:
+                raise ConflictError(f"run {new_run_id} already exists")
+            if not verify_chain(source["provenance"]):
+                raise ConflictError(f"run {run_id} is not reproducible")
+            sample = self.get_sample(source["sample_id"])
+            result = execute({"records": sample["records"]}, sample["vcf"], source["params"])
+            reproducible = (
+                [entry["output_sha256"] for entry in result["provenance"]]
+                == [entry["output_sha256"] for entry in source["provenance"]]
+                and result["statistics"] == source["statistics"]
+                and result["variants"] == source["variants"]
+            )
+            if not reproducible:
+                raise ConflictError(f"run {run_id} is not reproducible")
+            document = {
+                "id": new_run_id,
+                "params": source["params"],
+                "provenance": result["provenance"],
+                "sample_id": source["sample_id"],
+                "sample_sha256": source["sample_sha256"],
+                "statistics": result["statistics"],
+                "variants": result["variants"],
+            }
+            self.store.connection.execute(
+                "INSERT INTO runs(id, sample_id, document) VALUES (?, ?, ?)",
+                (new_run_id, source["sample_id"], self.store.encode(document)),
+            )
+            return run_view(document)
+
+        return self._idempotent(key, f"replay-run:{run_id}:{new_run_id}", replay)
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         return run_view(self._document(run_id))
 
@@ -305,6 +344,29 @@ class VariantRail:
             "impact_summary": {key: impact_accumulator[key] for key in sorted(impact_accumulator)},
             "run_count": run_count,
             "runs": runs,
+        }
+
+    def run_snapshot(self, run_id: str) -> dict[str, Any]:
+        """Immutable replay recipe of a saved run; read-only.
+
+        Only the stored run document is read: the pipeline never re-runs and
+        no data is rewritten, so repeated requests are byte-identical.
+        """
+        document = self._document(run_id)
+        provenance = document["provenance"]
+        steps = {entry["name"]: entry for entry in provenance}
+        return {
+            "run_id": run_id,
+            "sample_id": document["sample_id"],
+            "sample_sha256": document["sample_sha256"],
+            "params": document["params"],
+            "parser_version": steps["ingest"]["params"]["parser_version"],
+            "annotation_table_sha256": steps["annotate"]["params"]["annotation_table_sha256"],
+            "provenance_head": provenance[-1]["hash"],
+            "step_output_sha256": {
+                name: steps[name]["output_sha256"]
+                for name in ("ingest", "filter", "annotate", "summarize")
+            },
         }
 
     def run_provenance(self, run_id: str) -> dict[str, Any]:

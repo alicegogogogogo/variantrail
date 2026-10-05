@@ -532,6 +532,137 @@ class VariantRailTests(unittest.TestCase):
             self.service.run_provenance("run-2")["steps"],
         )
 
+    # --- snapshot and replay -----------------------------------------------
+
+    def test_snapshot_returns_the_saved_recipe(self):
+        from variantrail.annotate import table_sha256
+
+        self.sample()
+        run = self.start_run({"min_qual": 30, "genes": ["MTHFR"]})
+        snapshot = self.service.run_snapshot("run-1")
+        self.assertEqual(
+            [
+                "run_id", "sample_id", "sample_sha256", "params", "parser_version",
+                "annotation_table_sha256", "provenance_head", "step_output_sha256",
+            ],
+            list(snapshot),
+        )
+        self.assertEqual("run-1", snapshot["run_id"])
+        self.assertEqual("s1", snapshot["sample_id"])
+        self.assertEqual(run["sample_sha256"], snapshot["sample_sha256"])
+        self.assertEqual(run["params"], snapshot["params"])
+        self.assertEqual("variantrail-vcf-1", snapshot["parser_version"])
+        self.assertEqual(table_sha256(), snapshot["annotation_table_sha256"])
+        self.assertEqual(run["provenance_head"], snapshot["provenance_head"])
+        steps = self.service.run_provenance("run-1")["steps"]
+        self.assertEqual(["ingest", "filter", "annotate", "summarize"], list(snapshot["step_output_sha256"]))
+        self.assertEqual(
+            [entry["output_sha256"] for entry in steps],
+            list(snapshot["step_output_sha256"].values()),
+        )
+
+    def test_snapshot_is_stable_and_read_only(self):
+        self.sample()
+        self.start_run()
+        first = self.service.run_snapshot("run-1")
+        second = self.service.run_snapshot("run-1")
+        self.assertEqual(first, second)
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.run_snapshot("missing")
+
+    def test_replay_recreates_an_identical_run(self):
+        self.sample()
+        source = self.start_run({"min_qual": 30, "pass_only": True}, key="r1", run_id="run-1")
+        replayed = self.service.replay_run("run-1", {"id": "run-2"}, "r2")
+        self.assertEqual({**source, "id": "run-2"}, replayed)
+        self.assertEqual(replayed, self.service.get_run("run-2"))
+        # The replay inherits the sample identity and the saved parameters.
+        self.assertEqual("s1", replayed["sample_id"])
+        self.assertEqual(source["sample_sha256"], replayed["sample_sha256"])
+        self.assertEqual(source["params"], replayed["params"])
+        # Snapshots of source and replay differ only in the run id.
+        self.assertEqual(
+            {**self.service.run_snapshot("run-1"), "run_id": "run-2"},
+            self.service.run_snapshot("run-2"),
+        )
+        # Existing read endpoints work on the replay with their usual semantics.
+        variants = self.service.run_variants("run-2")
+        self.assertEqual("run-2", variants["run_id"])
+        self.assertEqual(self.service.run_variants("run-1")["variants"], variants["variants"])
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+        self.assertTrue(self.service.run_provenance("run-2")["verified"])
+
+    def test_replay_body_must_be_exactly_id(self):
+        self.sample()
+        self.start_run()
+        for body in ({}, {"id": "run-2", "params": {}}, {"id": "run-2", "vcf": "x"}, "run-2", None, []):
+            with self.subTest(body=body), self.assertRaisesRegex(ValidationError, "replay must contain exactly id"):
+                self.service.replay_run("run-1", body, "r2")
+        with self.assertRaisesRegex(ValidationError, "run id must match"):
+            self.service.replay_run("run-1", {"id": "bad id!"}, "r2")
+        with self.assertRaisesRegex(NotFoundError, "run run-2 was not found"):
+            self.service.get_run("run-2")
+
+    def test_replay_requires_an_idempotency_key(self):
+        self.sample()
+        self.start_run()
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.replay_run("run-1", {"id": "run-2"}, None)
+
+    def test_replay_missing_source_is_not_found(self):
+        self.sample()
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.replay_run("missing", {"id": "run-2"}, "r2")
+
+    def test_replay_to_an_existing_id_conflicts(self):
+        self.sample()
+        self.start_run(key="r1", run_id="run-1")
+        self.start_run(key="r2", run_id="run-2")
+        with self.assertRaisesRegex(ConflictError, "run run-2 already exists"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "r3")
+        with self.assertRaisesRegex(ConflictError, "run run-1 already exists"):
+            self.service.replay_run("run-1", {"id": "run-1"}, "r4")
+
+    def test_replay_rejects_tampered_statistics_without_saving(self):
+        self.sample()
+        self.start_run()
+        document = self.service._document("run-1")
+        document["statistics"]["records_kept"] = 999
+        self.service.store.connection.execute(
+            "UPDATE runs SET document = ? WHERE id = ?", (self.service.store.encode(document), "run-1")
+        )
+        with self.assertRaisesRegex(ConflictError, "run run-1 is not reproducible"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "r2")
+        with self.assertRaisesRegex(NotFoundError, "run run-2 was not found"):
+            self.service.get_run("run-2")
+        # The failed attempt stored no idempotency response; the key stays free.
+        self.start_run(key="r2", run_id="run-3")
+
+    def test_replay_rejects_a_broken_source_chain(self):
+        self.sample()
+        self.start_run()
+        document = self.service._document("run-1")
+        document["provenance"][1]["params"]["min_qual"] = 999.0
+        self.service.store.connection.execute(
+            "UPDATE runs SET document = ? WHERE id = ?", (self.service.store.encode(document), "run-1")
+        )
+        with self.assertRaisesRegex(ConflictError, "run run-1 is not reproducible"):
+            self.service.replay_run("run-1", {"id": "run-2"}, "r2")
+        with self.assertRaisesRegex(NotFoundError, "run run-2 was not found"):
+            self.service.get_run("run-2")
+
+    def test_replay_retry_returns_the_first_response(self):
+        self.sample()
+        self.start_run()
+        first = self.service.replay_run("run-1", {"id": "run-2"}, "rk")
+        second = self.service.replay_run("run-1", {"id": "run-2"}, "rk")
+        self.assertEqual(first, second)
+        with self.assertRaises(ConflictError):
+            self.service.replay_run("run-1", {"id": "run-3"}, "rk")
+        with self.assertRaises(ConflictError):
+            self.start_run(key="rk", run_id="run-4")
+
     # --- quality control ---------------------------------------------------
 
     def test_qc_summarizes_retained_records_and_alleles(self):
@@ -1522,6 +1653,132 @@ class CohortHttpTests(unittest.TestCase):
             {"run_count", "runs", "alleles", "counts", "frequency_summary", "gene_summary", "impact_summary"},
             set(json.loads(cohort_body)),
         )
+
+
+class SnapshotReplayHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1", "params": {"min_qual": 30}}, "r1")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def post(self, path, body, key=None):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(body).encode(),
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/json")
+        if key is not None:
+            request.add_header("Idempotency-Key", key)
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_snapshot_endpoint_returns_the_recipe_byte_stably(self):
+        status, content_type, body = self.get("/runs/run-1/snapshot")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual(
+            {
+                "run_id", "sample_id", "sample_sha256", "params", "parser_version",
+                "annotation_table_sha256", "provenance_head", "step_output_sha256",
+            },
+            set(payload),
+        )
+        self.assertEqual("run-1", payload["run_id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual("variantrail-vcf-1", payload["parser_version"])
+        self.assertEqual(
+            ["ingest", "filter", "annotate", "summarize"],
+            list(payload["step_output_sha256"]),
+        )
+        _, _, again = self.get("/runs/run-1/snapshot")
+        self.assertEqual(body, again)
+        status, _, body = self.get("/runs/missing/snapshot")
+        self.assertEqual(404, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+
+    def test_replay_endpoint_creates_an_identical_run(self):
+        status, content_type, body = self.post("/runs/run-1/replays", {"id": "run-2"}, key="replay-1")
+        self.assertEqual(201, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual("run-2", payload["id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual("succeeded", payload["status"])
+        status, _, source_body = self.get("/runs/run-1")
+        source = json.loads(source_body)
+        self.assertEqual(
+            {key: value for key, value in source.items() if key != "id"},
+            {key: value for key, value in payload.items() if key != "id"},
+        )
+        # The new run serves every existing read endpoint.
+        status, _, _ = self.get("/runs/run-2/variants")
+        self.assertEqual(200, status)
+        status, _, _ = self.get("/runs/run-2/snapshot")
+        self.assertEqual(200, status)
+        # A retry with the same key returns the first response.
+        status, _, retry = self.post("/runs/run-1/replays", {"id": "run-2"}, key="replay-1")
+        self.assertEqual(201, status)
+        self.assertEqual(body, retry)
+
+    def test_replay_endpoint_errors_use_the_standard_error_object(self):
+        status, _, body = self.post("/runs/run-1/replays", {"id": "run-2"})
+        self.assertEqual(400, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertEqual("Idempotency-Key header is required", error["message"])
+        status, _, body = self.post("/runs/run-1/replays", {"id": "run-2", "params": {}}, key="k1")
+        self.assertEqual(400, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("validation_error", error["code"])
+        self.assertEqual("replay must contain exactly id", error["message"])
+        status, _, body = self.post("/runs/run-1/replays", {"id": "run-1"}, key="k2")
+        self.assertEqual(409, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("conflict", error["code"])
+        self.assertEqual("run run-1 already exists", error["message"])
+        status, _, body = self.post("/runs/missing/replays", {"id": "run-2"}, key="k3")
+        self.assertEqual(404, status)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
+        # Nothing was saved by the failed attempts.
+        status, _, _ = self.get("/runs/run-2")
+        self.assertEqual(404, status)
 
 
 if __name__ == "__main__":

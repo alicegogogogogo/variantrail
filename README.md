@@ -496,6 +496,56 @@ re-reads the stored sample VCF, re-executes all four steps with the stored
 variants. `verified` is the conjunction of both; the endpoint never rewrites the
 stored trail.
 
+### Get a run snapshot
+
+`GET /runs/run-1/snapshot` returns the run's immutable replay recipe, read
+only from the stored run document — the pipeline is not re-executed and no
+data is rewritten, so repeated requests are byte-for-byte identical:
+
+```json
+{"run_id":"run-1","sample_id":"trio-1",
+ "sample_sha256":"45520c9b...","params":{"genes":[],"impacts":[],"min_dp":0,"min_qual":0.0,"pass_only":false},
+ "parser_version":"variantrail-vcf-1",
+ "annotation_table_sha256":"...","provenance_head":"40807a2c...",
+ "step_output_sha256":{"ingest":"...","filter":"...","annotate":"...","summarize":"..."}}
+```
+
+`params` is the saved parameter object; `parser_version` and
+`annotation_table_sha256` come from the run's own provenance links, and
+`step_output_sha256` lists the four step output digests in execution order.
+An unknown run id returns 404 `not_found`.
+
+### Replay a run
+
+```http
+POST /runs/run-1/replays
+Idempotency-Key: replay-1
+Content-Type: application/json
+
+{"id":"run-2"}
+```
+
+Replays the finished run `run-1` as a new run: the service re-executes the
+four-step pipeline on the source run's original VCF with the source run's
+saved parameters — the body carries exactly `id` and cannot substitute
+parameters or input. Before saving anything it verifies the source run's
+hash chain, then compares the new run's four step output digests, statistics
+and variants against the source run. Only when everything matches is the new
+run saved atomically, returning HTTP 201 with the same run view as run
+creation; the new run inherits the source `sample_id`, `sample_sha256` and
+`params`, and every existing read endpoint applies to it unchanged. The
+source run and its sample are never modified.
+
+Errors: an unknown source run is 404 `not_found`; a body that is not exactly
+`{"id":...}` is 400 `validation_error` (`replay must contain exactly id`,
+with the usual identifier rules for `id`); an already-used new id is 409
+`conflict` (`run <id> already exists`); a broken source hash chain or any
+mismatch in the reproduced digests, statistics or variants is 409 `conflict`
+(`run <run_id> is not reproducible`) and neither the new run nor the
+idempotency response is saved. `Idempotency-Key` follows the existing
+contract: it is required, a key reused for a different operation conflicts,
+and a successful retry returns the first response.
+
 ## Step-level lineage manifest
 
 `variantrail.pipeline.execute(parsed, vcf_text, params)` — the analysis entry
