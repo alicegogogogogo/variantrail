@@ -5,6 +5,7 @@ from typing import Any
 
 from .annotate import annotate, table_sha256
 from .errors import ValidationError
+from .lineage import GENESIS_SHA256, json_snapshot, manifest as build_manifest, record as lineage_record
 from .provenance import digest, digest_text, step
 from .recordfilter import evaluate_record_filter, normalize_record_filter
 
@@ -56,20 +57,60 @@ def normalize_params(raw: Any) -> dict[str, Any]:
     return params
 
 
-def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Run ingest -> filter -> annotate -> summarize and record each link."""
+def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any], lineage: bool = False) -> dict[str, Any]:
+    """Run ingest -> filter -> annotate -> summarize and record each link.
+
+    With ``lineage=True`` the result additionally carries a self-contained
+    ``lineage`` manifest (see :mod:`variantrail.lineage`). A non-boolean
+    ``lineage`` raises ``TypeError``; so do parameters whose values cannot be
+    represented as JSON, and that check runs before any pipeline step.
+    """
+    if not isinstance(lineage, bool):
+        raise TypeError("lineage must be a boolean")
+    if lineage:
+        # Validated and isolated before any step executes; later mutation of
+        # the caller's params can never reach the returned manifest.
+        params_snapshot = json_snapshot(params)
+    else:
+        params_snapshot = None
     steps: list[dict[str, Any]] = []
+    lineage_steps: list[dict[str, Any]] = []
+
+    def link(
+        name: str,
+        step_params: dict[str, Any],
+        input_sha256: str,
+        output_sha256: str,
+    ) -> None:
+        """Append one provenance link and, when enabled, its lineage record."""
+        steps.append(
+            step(
+                len(steps) + 1,
+                name,
+                step_params,
+                input_sha256,
+                output_sha256,
+                None if not steps else steps[-1]["hash"],
+            )
+        )
+        if lineage:
+            previous_sha256 = GENESIS_SHA256 if not lineage_steps else lineage_steps[-1]["sha256"]
+            lineage_steps.append(
+                lineage_record(
+                    name,
+                    json_snapshot(step_params),
+                    input_sha256,
+                    output_sha256,
+                    previous_sha256,
+                )
+            )
 
     records = parsed["records"]
-    steps.append(
-        step(
-            1,
-            "ingest",
-            {"parser_version": PARSER_VERSION},
-            digest_text(vcf_text),
-            digest({"records": records}),
-            None,
-        )
+    link(
+        "ingest",
+        {"parser_version": PARSER_VERSION},
+        digest_text(vcf_text),
+        digest({"records": records}),
     )
 
     reasons = list(RECORD_FILTER_REASONS)
@@ -91,15 +132,11 @@ def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> di
     }
     if expression is not None:
         filter_params["record_filter"] = expression
-    steps.append(
-        step(
-            2,
-            "filter",
-            filter_params,
-            steps[-1]["output_sha256"],
-            digest({"filter_counts": counts, "records": kept}),
-            steps[-1]["hash"],
-        )
+    link(
+        "filter",
+        filter_params,
+        steps[-1]["output_sha256"],
+        digest({"filter_counts": counts, "records": kept}),
     )
 
     variants: list[dict[str, Any]] = []
@@ -111,25 +148,29 @@ def execute(parsed: dict[str, Any], vcf_text: str, params: dict[str, Any]) -> di
             continue
         variants.append(variant_document(record, annotations))
     counts = {**counts, "allele_filtered": filtered}
-    steps.append(
-        step(
-            3,
-            "annotate",
-            {
-                "annotation_table_sha256": table_sha256(),
-                "genes": params["genes"],
-                "impacts": params["impacts"],
-            },
-            steps[-1]["output_sha256"],
-            digest({"filter_counts": counts, "variants": variants}),
-            steps[-1]["hash"],
-        )
+    link(
+        "annotate",
+        {
+            "annotation_table_sha256": table_sha256(),
+            "genes": params["genes"],
+            "impacts": params["impacts"],
+        },
+        steps[-1]["output_sha256"],
+        digest({"filter_counts": counts, "variants": variants}),
     )
 
     statistics = summarize(records, variants, counts)
-    steps.append(step(4, "summarize", {}, steps[-1]["output_sha256"], digest(statistics), steps[-1]["hash"]))
+    link("summarize", {}, steps[-1]["output_sha256"], digest(statistics))
 
-    return {"filter_counts": counts, "provenance": steps, "statistics": statistics, "variants": variants}
+    result: dict[str, Any] = {
+        "filter_counts": counts,
+        "provenance": steps,
+        "statistics": statistics,
+        "variants": variants,
+    }
+    if lineage:
+        result["lineage"] = build_manifest(vcf_text, params_snapshot, lineage_steps)
+    return result
 
 
 def record_reason(record: dict[str, Any], params: dict[str, Any]) -> str | None:
