@@ -942,6 +942,112 @@ class VariantRailTests(unittest.TestCase):
         self.assertEqual(jsonl_before, self.service.run_export("run-1", "jsonl")[1])
         self.assertTrue(self.service.run_provenance("run-1")["verified"])
 
+    # --- transcript consequences ---------------------------------------------
+
+    def test_transcripts_expand_alleles_in_file_and_annotation_order(self):
+        self.sample()
+        run = self.start_run()
+        payload = self.service.run_transcripts("run-1")
+        self.assertEqual("run-1", payload["run_id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual(run["provenance_head"], payload["provenance_head"])
+        self.assertEqual(8, payload["allele_count"])
+        self.assertEqual(8, len(payload["alleles"]))
+        self.assertEqual(
+            [
+                ("chr1", 11856378, "G", "A", 1),
+                ("chr1", 11856378, "G", "T", 1),
+                ("chr1", 11856379, "A", "G", 1),
+                ("chr7", 55019017, "G", "GA", 1),
+                ("chr7", 55019017, "G", "T", 1),
+                ("chr12", 25245350, "C", "A", 1),
+                ("chr12", 25245350, "C", "T", 2),
+                ("chr17", 43093445, "C", "T", 1),
+            ],
+            [
+                (a["chrom"], a["pos"], a["ref"], a["alt"], a["allele_index"])
+                for a in payload["alleles"]
+            ],
+        )
+        for allele in payload["alleles"]:
+            self.assertEqual(
+                {"chrom", "pos", "ref", "alt", "allele_index", "gene", "preferred", "transcripts"},
+                set(allele),
+            )
+
+    def test_transcripts_candidates_are_sorted_and_preferred_is_first(self):
+        self.sample()
+        self.start_run()
+        payload = self.service.run_transcripts("run-1")
+        by_identity = {(a["chrom"], a["pos"], a["ref"], a["alt"]): a for a in payload["alleles"]}
+        mthfr = by_identity[("chr1", 11856378, "G", "A")]
+        self.assertEqual("MTHFR", mthfr["gene"])
+        self.assertEqual(
+            [
+                {"transcript_id": "MTHFR-001", "status": "MANE_SELECT",
+                 "consequence": "missense_variant", "impact": "MODERATE"},
+                {"transcript_id": "MTHFR-002", "status": "CANONICAL",
+                 "consequence": "synonymous_variant", "impact": "LOW"},
+                {"transcript_id": "MTHFR-003", "status": "OTHER",
+                 "consequence": "intron_variant", "impact": "MODIFIER"},
+            ],
+            mthfr["transcripts"],
+        )
+        self.assertEqual(mthfr["transcripts"][0], mthfr["preferred"])
+        egfr = by_identity[("chr7", 55019017, "G", "GA")]
+        self.assertEqual("EGFR", egfr["gene"])
+        self.assertEqual(
+            [
+                {"transcript_id": "EGFR-001", "status": "MANE_SELECT",
+                 "consequence": "frameshift_variant", "impact": "HIGH"},
+                {"transcript_id": "EGFR-002", "status": "CANONICAL",
+                 "consequence": "inframe_insertion", "impact": "MODERATE"},
+            ],
+            egfr["transcripts"],
+        )
+        self.assertEqual(egfr["transcripts"][0], egfr["preferred"])
+        # Every other tabled allele carries exactly its MANE_SELECT candidate.
+        kras = by_identity[("chr12", 25245350, "C", "A")]
+        self.assertEqual(
+            [{"transcript_id": "KRAS-001", "status": "MANE_SELECT",
+              "consequence": "missense_variant", "impact": "MODERATE"}],
+            kras["transcripts"],
+        )
+        self.assertEqual(kras["transcripts"][0], kras["preferred"])
+
+    def test_transcripts_untabled_allele_has_null_gene_and_no_candidates(self):
+        self.sample()
+        self.start_run()
+        payload = self.service.run_transcripts("run-1")
+        by_identity = {(a["chrom"], a["pos"], a["ref"], a["alt"]): a for a in payload["alleles"]}
+        untabled = by_identity[("chr1", 11856379, "A", "G")]
+        self.assertIsNone(untabled["gene"])
+        self.assertIsNone(untabled["preferred"])
+        self.assertEqual([], untabled["transcripts"])
+
+    def test_transcripts_empty_run_returns_zero_and_empty_array(self):
+        self.sample()
+        self.start_run({"genes": ["NO_SUCH_GENE"]})
+        payload = self.service.run_transcripts("run-1")
+        self.assertEqual(0, payload["allele_count"])
+        self.assertEqual([], payload["alleles"])
+
+    def test_transcripts_unknown_run_is_not_found(self):
+        with self.assertRaisesRegex(NotFoundError, "run missing was not found"):
+            self.service.run_transcripts("missing")
+
+    def test_transcripts_is_byte_stable_and_read_only(self):
+        self.sample()
+        self.start_run()
+        before = self.service._document("run-1")
+        first = self.service.run_transcripts("run-1")
+        second = self.service.run_transcripts("run-1")
+        self.assertEqual(first, second)
+        canonical = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        self.assertEqual(canonical(first).encode(), canonical(second).encode())
+        self.assertEqual(before, self.service._document("run-1"))
+        self.assertTrue(self.service.run_provenance("run-1")["verified"])
+
     # --- comparison --------------------------------------------------------
 
     def test_compare_partitions_alleles_into_shared_and_left_only(self):
@@ -1587,6 +1693,84 @@ class QcHttpTests(unittest.TestCase):
         status, _, body = self.get("/runs/run-1/nope")
         self.assertEqual(404, status)
         self.assertEqual("not_found", json.loads(body)["error"]["code"])
+
+
+class TranscriptsHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        service = VariantRail(str(Path(self.directory.name) / "test.db"))
+        service.create_sample({"id": "s1", "vcf": VCF}, "s1")
+        service.create_run("s1", {"id": "run-1"}, "r1")
+        service.create_run("s1", {"id": "run-2", "params": {"genes": ["NO_SUCH_GENE"]}}, "r2")
+        Handler.service = service
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.directory.cleanup()
+
+    def get(self, path):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers["Content-Type"], response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            content_type = error.headers["Content-Type"]
+            status = error.code
+            error.close()
+            return status, content_type, body
+
+    def test_transcripts_endpoint_returns_the_consequences(self):
+        status, content_type, body = self.get("/runs/run-1/transcripts")
+        self.assertEqual(200, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        payload = json.loads(body)
+        self.assertEqual(
+            {"run_id", "sample_id", "provenance_head", "allele_count", "alleles"},
+            set(payload),
+        )
+        self.assertEqual("run-1", payload["run_id"])
+        self.assertEqual("s1", payload["sample_id"])
+        self.assertEqual(8, payload["allele_count"])
+        self.assertEqual(8, len(payload["alleles"]))
+        first = payload["alleles"][0]
+        self.assertEqual(("chr1", 11856378, "G", "A"), (first["chrom"], first["pos"], first["ref"], first["alt"]))
+        self.assertEqual("MTHFR", first["gene"])
+        self.assertEqual(
+            ["MTHFR-001", "MTHFR-002", "MTHFR-003"],
+            [entry["transcript_id"] for entry in first["transcripts"]],
+        )
+        self.assertEqual(first["transcripts"][0], first["preferred"])
+        self.assertEqual(
+            ["MANE_SELECT", "CANONICAL", "OTHER"],
+            [entry["status"] for entry in first["transcripts"]],
+        )
+
+    def test_transcripts_endpoint_empty_run_is_zero_filled(self):
+        status, _, body = self.get("/runs/run-2/transcripts")
+        self.assertEqual(200, status)
+        payload = json.loads(body)
+        self.assertEqual(0, payload["allele_count"])
+        self.assertEqual([], payload["alleles"])
+
+    def test_transcripts_endpoint_repeated_requests_are_byte_identical(self):
+        _, _, first = self.get("/runs/run-1/transcripts")
+        _, _, second = self.get("/runs/run-1/transcripts")
+        self.assertEqual(first, second)
+
+    def test_transcripts_endpoint_errors_follow_standard_object_and_routes(self):
+        status, content_type, body = self.get("/runs/missing/transcripts")
+        self.assertEqual(404, status)
+        self.assertEqual("application/json; charset=utf-8", content_type)
+        error = json.loads(body)["error"]
+        self.assertEqual("not_found", error["code"])
+        self.assertEqual("run missing was not found", error["message"])
 
 
 class CompareHttpTests(unittest.TestCase):

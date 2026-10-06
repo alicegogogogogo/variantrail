@@ -271,6 +271,53 @@ A run with no retained variants still returns 200 with all counts zero, the
 `not_found` with the message `run <run_id> was not found`. Repeated requests
 for the same run return byte-identical JSON.
 
+### Get run transcript consequences
+
+`GET /runs/run-1/transcripts` expands every retained ALT allele of a saved run
+into its candidate transcript consequences. It only reads the stored run and
+the built-in transcript table: no pipeline step is re-executed, no external
+data is consulted, and the run, its variants and its provenance are unchanged.
+No `Idempotency-Key` is required. Returns HTTP 200:
+
+```json
+{"run_id":"run-1","sample_id":"trio-1","provenance_head":"...","allele_count":8,
+ "alleles":[{"chrom":"chr1","pos":11856378,"ref":"G","alt":"A","allele_index":1,
+   "gene":"MTHFR",
+   "preferred":{"transcript_id":"MTHFR-001","status":"MANE_SELECT",
+     "consequence":"missense_variant","impact":"MODERATE"},
+   "transcripts":[{"transcript_id":"MTHFR-001","status":"MANE_SELECT",
+     "consequence":"missense_variant","impact":"MODERATE"},
+    {"transcript_id":"MTHFR-002","status":"CANONICAL",
+     "consequence":"synonymous_variant","impact":"LOW"},
+    {"transcript_id":"MTHFR-003","status":"OTHER",
+     "consequence":"intron_variant","impact":"MODIFIER"}]}]}
+```
+
+- `alleles` follows the stored variants in file order and, within each
+  variant, annotation order; identical coordinates from different records are
+  not merged. `allele_count` always equals the length of `alleles`, and a run
+  with no retained variants returns `0` and an empty array.
+- Each allele carries `chrom`, `pos`, `ref`, `alt`, the 1-based
+  `allele_index`, `gene`, `preferred` and `transcripts`.
+- Each candidate carries `transcript_id`, `status`, `consequence` and
+  `impact`. Candidates are sorted by `status` (`MANE_SELECT`, `CANONICAL`,
+  `OTHER`), then `impact` (`HIGH`, `MODERATE`, `LOW`, `MODIFIER`, `UNKNOWN`),
+  then `transcript_id` in text order; `preferred` is the first candidate.
+- An allele with no exact table match has `gene: null`, `preferred: null` and
+  an empty `transcripts` array.
+
+The built-in transcript table is derived from the annotation table: every
+annotation record contributes one `MANE_SELECT` candidate whose
+`transcript_id` is the gene symbol plus `-001`, keeping the record's
+consequence and impact. Three extra candidates are built in: `MTHFR-002`
+(`CANONICAL`, `synonymous_variant`, `LOW`) and `MTHFR-003` (`OTHER`,
+`intron_variant`, `MODIFIER`) for `chr1:11856378 G>A`, and `EGFR-002`
+(`CANONICAL`, `inframe_insertion`, `MODERATE`) for `chr7:55019017 G>GA`.
+
+An unknown `run_id` returns 404 `not_found` with the message
+`run <run_id> was not found`. Repeated requests return byte-identical JSON and
+never write to the database.
+
 ### Export run results
 
 `GET /runs/run-1/exports/jsonl`, `GET /runs/run-1/exports/tsv` and

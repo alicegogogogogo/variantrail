@@ -8,6 +8,7 @@ from .model import identifier, run_view, sample_view
 from .pipeline import execute, normalize_params
 from .provenance import digest_text, verify_chain
 from .store import Store
+from .transcripts import transcripts_for
 from .vcf import parse_vcf
 
 
@@ -248,6 +249,44 @@ class VariantRail:
             "run_id": run_id,
             "sample_id": document["sample_id"],
             "sample_sha256": document["sample_sha256"],
+        }
+
+    def run_transcripts(self, run_id: str) -> dict[str, Any]:
+        """Transcript consequences of the retained alleles of a saved run; read-only.
+
+        Only the stored run document is read: no pipeline step re-runs and the
+        run, its variants and its provenance are never rewritten. Alleles are
+        expanded in variant file order and annotation order without merging
+        identical coordinates.
+        """
+        document = self._document(run_id)
+        alleles: list[dict[str, Any]] = []
+        for variant in document["variants"]:
+            for annotation in variant["annotations"]:
+                match = transcripts_for(variant["chrom"], variant["pos"], variant["ref"], annotation["allele"])
+                if match is None:
+                    gene, preferred, transcripts = None, None, []
+                else:
+                    gene, transcripts = match
+                    preferred = transcripts[0]
+                alleles.append(
+                    {
+                        "allele_index": annotation["allele_index"],
+                        "alt": annotation["allele"],
+                        "chrom": variant["chrom"],
+                        "gene": gene,
+                        "pos": variant["pos"],
+                        "preferred": preferred,
+                        "ref": variant["ref"],
+                        "transcripts": transcripts,
+                    }
+                )
+        return {
+            "allele_count": len(alleles),
+            "alleles": alleles,
+            "provenance_head": document["provenance"][-1]["hash"],
+            "run_id": run_id,
+            "sample_id": document["sample_id"],
         }
 
     def run_export(self, run_id: str, format: str) -> tuple[str, bytes]:
