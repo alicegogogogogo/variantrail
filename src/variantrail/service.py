@@ -8,6 +8,7 @@ from .model import identifier, run_view, sample_view
 from .pipeline import execute, normalize_params
 from .provenance import digest_text, verify_chain
 from .store import Store
+from .transcripts import lookup_transcripts
 from .vcf import parse_vcf
 
 
@@ -248,6 +249,40 @@ class VariantRail:
             "run_id": run_id,
             "sample_id": document["sample_id"],
             "sample_sha256": document["sample_sha256"],
+        }
+
+    def run_transcripts(self, run_id: str) -> dict[str, Any]:
+        """Candidate transcripts per retained allele of a saved run; read-only.
+
+        Alleles expand in stored variant file order and annotation order
+        without merging identical coordinates. Only the built-in transcript
+        table is consulted: nothing re-runs and nothing is rewritten.
+        """
+        document = self._document(run_id)
+        alleles: list[dict[str, Any]] = []
+        for variant in document["variants"]:
+            for annotation in variant["annotations"]:
+                gene, candidates = lookup_transcripts(
+                    variant["chrom"], variant["pos"], variant["ref"], annotation["allele"]
+                )
+                alleles.append(
+                    {
+                        "allele_index": annotation["allele_index"],
+                        "alt": annotation["allele"],
+                        "chrom": variant["chrom"],
+                        "gene": gene,
+                        "pos": variant["pos"],
+                        "preferred": candidates[0] if candidates else None,
+                        "ref": variant["ref"],
+                        "transcripts": candidates,
+                    }
+                )
+        return {
+            "allele_count": len(alleles),
+            "alleles": alleles,
+            "provenance_head": document["provenance"][-1]["hash"],
+            "run_id": run_id,
+            "sample_id": document["sample_id"],
         }
 
     def run_export(self, run_id: str, format: str) -> tuple[str, bytes]:
